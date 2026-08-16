@@ -9,7 +9,7 @@ Though it's efficient, if you don't want the creator to see you blocked them, th
 
 ## How to download?
 1) Get a userscript manager, such as [Violentmonkey](https://violentmonkey.github.io)
-2) Click [here](https://github.com/CybernatedChris/Sudomemo-Theatre-Decrapifier/raw/refs/heads/main/decrapifier.js) and install it
+2) Click [here](https://github.com/CybernatedChris/Sudomemo-Theatre-Decrapifier/raw/refs/heads/main/decrapifier.user.js) and install it
 
 ## How to use it?
 ### PC:
