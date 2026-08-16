@@ -8,7 +8,7 @@ We all change when we age and while it's true that there are kids roaming around
 Though it's efficient, if you don't want the creator to see you blocked them, this is a much more appropriate and suitable solution to hide creators. Besides, I don't see a report function of being under 13 anywhere and it's painful to do this under a DSi.
 
 ## How to download?
-1) Get a userscript manager, such as [Violentmonkey](violentmonkey.github.io)
+1) Get a userscript manager, such as [Violentmonkey](https://violentmonkey.github.io)
 2) Click [here](https://github.com/CybernatedChris/Sudomemo-Theatre-Decrapifier/raw/refs/heads/main/decrapifier.js) and install it
 
 ## How to use it?
