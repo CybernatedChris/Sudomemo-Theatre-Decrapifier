@@ -15,7 +15,7 @@
     'use strict';
 
     const hideUpsells = GM_getValue('hideupsells', true);  // patreon, discord, sudomemo merchandise, uploading flipnotes as shorts
-    const hideGoodUpsells = GM_getValue('hidegoodupsells', true);  // wii room, 3ds guide, staying safe, organizer, archive, buy a creator room theme
+    const hideGoodUpsells = GM_getValue('hidegoodupsells', true);  // wii room, 3ds guide, staying safe, organizer, archive, buy a creator theme
     const hideFlipstreams = GM_getValue('hideflipstreams', true);  // hide flipstream
 
     if (location.pathname.startsWith('/chat') || location.pathname.startsWith('/watch/embed') || location.pathname.startsWith('/organizer')) return;
@@ -76,15 +76,25 @@
             opacity: 0.55 !important;
             pointer-events: none !important;
             user-select: none !important;
+            transition: none !important;
+            animation: none !important;
         }
-        /* Fully block interaction on blurred genealogy cards and all children */
+        /* Fully block interaction + kill any transitions on blurred cards and children */
         .sm-blurred-genealogy,
         .sm-blurred-genealogy * {
             pointer-events: none !important;
             cursor: default !important;
+            transition: none !important;
+            animation: none !important;
         }
         /* Hide any residual block button on blurred genealogy cards */
         .sm-blurred-genealogy .sm-btn-creator {
+            display: none !important;
+        }
+        /* Never put buttons on collapsed group cards */
+        .flipnote-genealogy-card.collapsed-group .sm-btn-creator,
+        .collapsed-group-content .sm-btn-creator,
+        .collapsed-group-layout .sm-btn-creator {
             display: none !important;
         }
         .flipnote-genealogy-card {
@@ -621,6 +631,137 @@
         });
     }
 
+    // Category grid: process EACH .category-thumbs .thumb individually (throttled)
+    let categoryThumbsLastRun = 0;
+    const CATEGORY_THUMBS_THROTTLE_MS = 1200;
+
+    function processCategoryThumbs(force = false) {
+        // Only run on pages that actually have category thumbs
+        if (!document.querySelector('.category-thumbs .thumb')) return;
+
+        const now = Date.now();
+        if (!force && now - categoryThumbsLastRun < CATEGORY_THUMBS_THROTTLE_MS) return;
+        categoryThumbsLastRun = now;
+
+        // Remove stray channel-hide buttons inside category thumb strips (once per pass)
+        document.querySelectorAll('.category-thumbs .sm-btn-channel, .category-grid .sm-btn-channel')
+            .forEach(btn => btn.remove());
+
+        document.querySelectorAll('.category-thumbs .thumb').forEach(thumb => {
+            // Reuse cached creator id when possible
+            let creatorId = thumb.dataset.smCreatorId || null;
+            let creatorName = thumb.dataset.smCreatorName || 'Unknown';
+
+            if (creatorId === '') return; // previously scanned, no id found
+
+            if (!creatorId) {
+                const img = thumb.querySelector('img.flipnote-hoverpreview-img, img[src*="/dynamic/thumbframe/"], img[src*="/dynamic/playback/"]');
+                if (img) {
+                    const src = img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-hover-preview-src') || '';
+                    const match = src.match(/\/dynamic\/(?:thumbframe|playback)\/([A-F0-9]{16})/i);
+                    if (match) creatorId = match[1].toUpperCase() + '@DSi';
+                }
+
+                if (!creatorId) {
+                    const link = thumb.querySelector('a[href*="/user/"]');
+                    if (link) {
+                        const match = (link.getAttribute('href') || '').match(/\/user\/([A-F0-9]{16}@DSi)/i);
+                        if (match) creatorId = match[1].toUpperCase();
+                    }
+                }
+
+                if (!creatorId) {
+                    thumb.dataset.smCreatorId = ''; // mark scanned
+                    return;
+                }
+
+                thumb.dataset.smCreatorId = creatorId;
+                thumb.dataset.smCreatorName = creatorName;
+            }
+
+            const isBlocked = isBlockedCreator(creatorId);
+            const isWhite = isWhitelisted(creatorId);
+            const wasHidden = thumb.classList.contains('sm-hidden');
+
+            // Only touch display when state changes
+            if (isBlocked && !wasHidden) {
+                thumb.style.display = 'none';
+                thumb.classList.add('sm-hidden');
+            } else if (!isBlocked && wasHidden) {
+                thumb.style.display = '';
+                thumb.classList.remove('sm-hidden');
+            }
+
+            if (isBlocked || creatorId === currentuser) {
+                const existing = thumb.querySelector('.sm-btn-creator');
+                if (existing) existing.remove();
+                return;
+            }
+
+            let btn = thumb.querySelector('.sm-btn-creator');
+            if (!btn) {
+                btn = document.createElement('button');
+                btn.className = 'sm-btn-creator btn btn-sm btn-outline-danger';
+                btn.type = 'button';
+                btn.title = 'Hide creator (click) · Whitelist (right-click / long-press)';
+                btn.innerHTML = '<i class="fas fa-ban"></i>';
+                btn.dataset.smState = 'normal';
+
+                btn.onclick = e => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    const id = thumb.dataset.smCreatorId;
+                    const name = thumb.dataset.smCreatorName || 'Unknown';
+                    if (!id) return;
+                    const upperId = id.toUpperCase();
+                    if (whitelistedcreators.some(c => c.id.toUpperCase() === upperId)) {
+                        unwhitelistCreator(id);
+                    } else if (blockedcreators.some(c => c.id.toUpperCase() === upperId)) {
+                        unblockCreator(id);
+                    } else {
+                        blockCreator(id, name);
+                    }
+                    processCategoryThumbs(true);
+                };
+
+                const toggleWhitelist = () => {
+                    const id = thumb.dataset.smCreatorId;
+                    const name = thumb.dataset.smCreatorName || 'Unknown';
+                    if (!id) return;
+                    const upperId = id.toUpperCase();
+                    if (whitelistedcreators.some(c => c.id.toUpperCase() === upperId)) unwhitelistCreator(id);
+                    else whitelistCreator(id, name);
+                    processCategoryThumbs(true);
+                };
+                btn.addEventListener('mousedown', e => { if (e.button === 2) { e.preventDefault(); toggleWhitelist(); } });
+                btn.addEventListener('touchstart', () => { longpresstimer = setTimeout(toggleWhitelist, 600); });
+                btn.addEventListener('touchend', () => clearTimeout(longpresstimer));
+                btn.addEventListener('touchcancel', () => clearTimeout(longpresstimer));
+                btn.addEventListener('contextmenu', e => e.preventDefault());
+
+                const anchor = thumb.querySelector('a') || thumb;
+                anchor.style.position = 'relative';
+                if (anchor.tagName === 'A') anchor.style.display = 'inline-block';
+                anchor.appendChild(btn);
+            }
+
+            // Update icon only when whitelist state changes
+            const wantState = isWhite ? 'white' : 'normal';
+            if (btn.dataset.smState !== wantState) {
+                btn.dataset.smState = wantState;
+                if (isWhite) {
+                    btn.className = 'sm-btn-creator btn btn-sm btn-success';
+                    btn.title = 'Remove whitelist (click)';
+                    btn.innerHTML = '<i class="fas fa-star"></i>';
+                } else {
+                    btn.className = 'sm-btn-creator btn btn-sm btn-outline-danger';
+                    btn.title = 'Hide creator (click) · Whitelist (right-click / long-press)';
+                    btn.innerHTML = '<i class="fas fa-ban"></i>';
+                }
+            }
+        });
+    }
+
     // Genealogy tree: blur blocked creators instead of hiding, add block/whitelist buttons
     // Heavily optimized, only runs when genealogy is present and only processes new/changed cards
     let genealogyLastRun = 0;
@@ -712,36 +853,120 @@
 
             // Instant blur
             if (isBlocked && !wasBlurred) {
+                card.style.transition = 'none';
+                card.style.animation = 'none';
                 card.classList.add('sm-blurred-genealogy');
+                card.style.filter = 'blur(6px)';
+                card.style.opacity = '0.55';
+                card.style.pointerEvents = 'none';
                 // Neutralize all links so they cannot navigate
                 card.querySelectorAll('a').forEach(a => {
                     a.dataset.smOrigHref = a.getAttribute('href') || '';
                     a.removeAttribute('href');
                     a.style.pointerEvents = 'none';
                     a.style.cursor = 'default';
+                    a.style.transition = 'none';
                 });
             } else if (!isBlocked && wasBlurred) {
                 card.classList.remove('sm-blurred-genealogy');
+                card.style.filter = '';
+                card.style.opacity = '';
+                card.style.pointerEvents = '';
+                card.style.transition = '';
+                card.style.animation = '';
                 // Restore links
                 card.querySelectorAll('a[data-sm-orig-href]').forEach(a => {
                     a.setAttribute('href', a.dataset.smOrigHref);
                     delete a.dataset.smOrigHref;
                     a.style.pointerEvents = '';
                     a.style.cursor = '';
+                    a.style.transition = '';
                 });
             }
 
-            // No block button on already-blocked (blurred) genealogy cards
-            if (isBlocked) {
+            // Skip block buttons on collapsed group cards and already-blocked cards
+            const isCollapsedGroup = card.classList.contains('collapsed-group') ||
+                                     card.classList.contains('collapsed-group-layout') ||
+                                     !!card.querySelector('.collapsed-group-content');
+
+            if (isBlocked || isCollapsedGroup) {
                 const existingBtn = card.querySelector('.sm-btn-creator');
                 if (existingBtn) existingBtn.remove();
             } else if (!card.querySelector('.sm-btn-creator') && !isWhite && creatorId !== currentuser) {
-                // Only add button for non-blocked, non-whitelisted creators
+                // Only add button for non-blocked, non-collapsed, non-whitelisted creators
                 addBlockBtn(card, 'creator', creatorId, creatorName, { blocked: false, whitelisted: false });
                 const btn = card.querySelector('.sm-btn-creator');
                 if (btn) {
                     btn.style.zIndex = '20';
                 }
+            }
+        });
+
+        // Remove blocked creators from collapsed-group thumbnail strips
+        root.querySelectorAll(
+            '.flipnote-genealogy-card.collapsed-group .collapsed-group-thumbnails img.collapsed-group-thumb, ' +
+            '.collapsed-group-layout .collapsed-group-content img.collapsed-group-thumb, ' +
+            '.collapsed-group-thumbnails img.collapsed-group-thumb'
+        ).forEach(img => {
+            const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
+            let blocked = false;
+
+            // Match full 16-char hex from thumbframe/playback path
+            const fullMatch = src.match(/\/dynamic\/(?:thumbframe|playback)\/([A-F0-9]{16})/i);
+            if (fullMatch) {
+                const id = fullMatch[1].toUpperCase() + '@DSi';
+                if (isBlockedCreator(id)) blocked = true;
+            }
+
+            // Fallback: 6-digit segment (first or last 6 of blocked creator hex)
+            if (!blocked) {
+                const sixMatch = src.match(/([A-F0-9]{6})/i);
+                if (sixMatch) {
+                    const six = sixMatch[1].toUpperCase();
+                    if (isLast6Blocked(six) || blockedcreators.some(c => {
+                        const hex = (c.id || '').split('@')[0].toUpperCase();
+                        return (hex.startsWith(six) || hex.endsWith(six)) && !isWhitelisted(c.id);
+                    })) {
+                        blocked = true;
+                    }
+                }
+            }
+
+            // Also check parent link if present
+            if (!blocked) {
+                const link = img.closest('a[href*="/user/"], a[href*="/watch/"]');
+                if (link) {
+                    const href = link.getAttribute('href') || '';
+                    const userMatch = href.match(/\/user\/([A-F0-9]{16}@DSi)/i);
+                    if (userMatch && isBlockedCreator(userMatch[1].toUpperCase())) {
+                        blocked = true;
+                    } else {
+                        const watchMatch = href.match(/\/watch\/([A-F0-9]{6})/i) || href.match(/([A-F0-9]{6})_/);
+                        if (watchMatch) {
+                            const six = watchMatch[1].toUpperCase();
+                            if (isLast6Blocked(six) || blockedcreators.some(c => {
+                                const hex = (c.id || '').split('@')[0].toUpperCase();
+                                return (hex.startsWith(six) || hex.endsWith(six)) && !isWhitelisted(c.id);
+                            })) {
+                                blocked = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (blocked) {
+                img.style.display = 'none';
+                img.classList.add('sm-hidden');
+                // Hide wrapper if it's just a single-thumb link/container
+                const wrap = img.closest('a, .collapsed-group-thumb-wrap, li');
+                if (wrap && wrap !== img.parentElement?.closest('.collapsed-group-thumbnails')) {
+                    wrap.style.display = 'none';
+                    wrap.classList.add('sm-hidden');
+                }
+            } else {
+                img.style.display = '';
+                img.classList.remove('sm-hidden');
             }
         });
     }
@@ -992,10 +1217,11 @@
     function processAll() {
         harvestCreatorNames();
         // Target outer search-result cards to avoid broken panel outline structures on the search pages
-        document.querySelectorAll('.flipnote-item, .flipnote-list-item, .channel-card, .playlist-flipnote, .trending-user, .recommended-item, li:has(.rec-thumbnail), .watch-next-item, .search-samples__item, .search-result').forEach(processItem);
+        document.querySelectorAll('.flipnote-item, .flipnote-list-item, .channel-card, .cat-box, .playlist-flipnote, .trending-user, .recommended-item, li:has(.rec-thumbnail), .watch-next-item, .search-samples__item, .search-result').forEach(processItem);
         processSpotlight(); // Run unconditionally so spotlight is evaluated even when flipstreams are hidden
         processEmbeds();
         processRelatedFlipnotes();
+        processCategoryThumbs();
         processGenealogy();
         if (!hideFlipstreams) {
             processFlipstreams();
@@ -1026,7 +1252,8 @@
         saveblockedcreators();
         creatormap.get(id)?.forEach(hide);
         processGenealogy(true);
-        processRelatedFlipnotes(); // hide spinoffs immediately
+        processRelatedFlipnotes();
+        processCategoryThumbs(true);
     }
 
     // Unblocks targeted IDs
@@ -1036,6 +1263,7 @@
         creatormap.get(id)?.forEach(show);
         processGenealogy(true);
         processRelatedFlipnotes();
+        processCategoryThumbs(true);
     }
 
     // Persistently whitelists specific IDs
@@ -1050,6 +1278,7 @@
         creatormap.get(id)?.forEach(show);
         processGenealogy(true);
         processRelatedFlipnotes();
+        processCategoryThumbs(true);
     }
 
     function unwhitelistCreator(id) {
@@ -1057,6 +1286,7 @@
         savewhitelistedcreators();
         processGenealogy(true);
         processRelatedFlipnotes();
+        processCategoryThumbs(true);
     }
 
     // Identifies target sidebar profile fields
@@ -1118,25 +1348,33 @@
     function addBlockBtn(el, type, id, name, status) {
         if (type === 'creator' && status.whitelisted) return;
         if (el.querySelector(`.sm-btn-${type}`)) return;
-        if (type === 'channel') {
-            const path = location.pathname;
-            if (path === '/categories' || path === '/categories/' || path.startsWith('/categories/8')) return;
-        }
-
         const btn = document.createElement('button');
         btn.className = `sm-btn-${type} btn btn-sm ${status.blocked ? 'btn-danger' : status.whitelisted ? 'btn-success' : 'btn-outline-danger'}`;
         btn.title = type === 'channel'
-            ? (status.blocked ? 'Show' : 'Hide')
+            ? (status.blocked ? 'Show channel' : 'Hide channel')
             : (status.whitelisted ? 'Remove whitelist' : 'Hide this creator');
+        // Use icon for both so the circular overlay button stays compact on thumbs
         btn.innerHTML = type === 'channel'
-            ? (status.blocked ? 'Show' : 'Hide')
+            ? (status.blocked ? '<i class="fas fa-eye"></i>' : '<i class="fas fa-eye-slash"></i>')
             : status.whitelisted ? '<i class="fas fa-star"></i>' : '<i class="fas fa-ban"></i>';
 
         btn.onclick = e => {
             e.stopPropagation();
             e.preventDefault();
             if (type === 'channel') {
-                status.blocked ? unblockChannel(id) : blockChannel(id, name);
+                if (status.blocked) {
+                    unblockChannel(id);
+                    status.blocked = false;
+                    btn.className = 'sm-btn-channel btn btn-sm btn-outline-danger';
+                    btn.title = 'Hide channel';
+                    btn.innerHTML = '<i class="fas fa-eye-slash"></i>';
+                } else {
+                    blockChannel(id, name);
+                    status.blocked = true;
+                    btn.className = 'sm-btn-channel btn btn-sm btn-danger';
+                    btn.title = 'Show channel';
+                    btn.innerHTML = '<i class="fas fa-eye"></i>';
+                }
             } else {
                 const upperId = id.toUpperCase();
                 const cached = creatorNameCache.get(upperId);
@@ -1176,11 +1414,18 @@
             btn.addEventListener('contextmenu', e => e.preventDefault());
         }
 
-        // Resolves the exact element to overlay the button over (supporting watch-next, playlist, search, related, genealogy)
-        const thumbContainer = el.querySelector('div.flipnote-item-thumb') ||
+        // Resolves the exact element to overlay the button over (supporting watch-next, playlist, search, related, genealogy, category channels)
+        // Prefer category grid path: .category-thumbs .thumb a > img.flipnote-hoverpreview-img
+        const catThumbImg = el.querySelector('.category-thumbs .thumb a img.flipnote-hoverpreview-img') ||
+                            el.querySelector('.category-thumbs img.flipnote-hoverpreview-img');
+        const thumbContainer = (catThumbImg && (catThumbImg.closest('a') || catThumbImg.parentElement)) ||
+                               el.querySelector('div.flipnote-item-thumb') ||
                                el.querySelector('.flipstream-thumbnail-card__frame') ||
                                el.querySelector('.related-preview a') ||
                                el.querySelector('.related-preview') ||
+                               el.querySelector('.category-thumbs .thumb a') ||
+                               el.querySelector('.category-thumbs .thumb') ||
+                               el.querySelector('.category-thumbs a') ||
                                el.querySelector('.flipnote-genealogy-card') ||
                                el.querySelector('.playlist-flipnote-thumb')?.parentElement ||
                                el.querySelector('.rec-thumbnail')?.parentElement ||
@@ -1196,6 +1441,11 @@
 
         if (thumbContainer) {
             thumbContainer.style.position = 'relative';
+            thumbContainer.style.display = thumbContainer.style.display || '';
+            // Ensure the anchor can host an absolute child
+            if (thumbContainer.tagName === 'A') {
+                thumbContainer.style.display = 'inline-block';
+            }
             thumbContainer.appendChild(btn);
         } else {
             const target = el.querySelector('.flipnote-stats, .stats, .username, .meta, .flipnote-item-info, .playlist-flipnote-info, .recommended-item-info') || el.lastElementChild;
@@ -1527,7 +1777,7 @@
             processSpotlight(); // Run unconditionally so spotlight is evaluated even when flipstreams are hidden
             processEmbeds();
             processRelatedFlipnotes();
-            // Genealogy is intentionally NOT run on every mutation. It is throttled in the interval below
+            // Category thumbs + genealogy are throttled in the interval, skip on every mutation
             if (!hideFlipstreams) {
                 processFlipstreams();
                 processFlipstreamSlides();
@@ -1535,8 +1785,8 @@
             muts.forEach(m => {
                 if (m.addedNodes.length) m.addedNodes.forEach(n => {
                     if (n.nodeType !== 1) return;
-                    if (n.matches('.flipnote-item, .flipnote-list-item, .channel-card, .playlist-flipnote, .trending-user, .recommended-item, li:has(.rec-thumbnail), .watch-next-item, .search-samples__item, .search-result')) processItem(n);
-                    else n.querySelectorAll('.flipnote-item, .flipnote-list-item, .channel-card, .playlist-flipnote, .trending-user, .recommended-item, li:has(.rec-thumbnail), .watch-next-item, .search-samples__item, .search-result').forEach(processItem);
+                    if (n.matches('.flipnote-item, .flipnote-list-item, .channel-card, .cat-box, .playlist-flipnote, .trending-user, .recommended-item, li:has(.rec-thumbnail), .watch-next-item, .search-samples__item, .search-result')) processItem(n);
+                    else n.querySelectorAll('.flipnote-item, .flipnote-list-item, .channel-card, .cat-box, .playlist-flipnote, .trending-user, .recommended-item, li:has(.rec-thumbnail), .watch-next-item, .search-samples__item, .search-result').forEach(processItem);
                 });
             });
         }).observe(document.body, {childList:true, subtree:true});
@@ -1545,8 +1795,14 @@
             harvestCreatorNames();
 
             // Trending creators are explicitly omitted from receiving block buttons, but stay hidden if blocked
-            document.querySelectorAll('.flipnote-item:not(.sm-btn-added), .flipnote-list-item:not(.sm-btn-added), .channel-card:not(.sm-btn-added), .playlist-flipnote:not(.sm-btn-added), .recommended-item:not(.sm-btn-added), li:has(.rec-thumbnail):not(.sm-btn-added), .watch-next-item:not(.sm-btn-added), .search-samples__item:not(.sm-btn-added), .search-result:not(.sm-btn-added)')
+            document.querySelectorAll('.flipnote-item:not(.sm-btn-added), .flipnote-list-item:not(.sm-btn-added), .channel-card:not(.sm-btn-added), .cat-box:not(.sm-btn-added), .playlist-flipnote:not(.sm-btn-added), .recommended-item:not(.sm-btn-added), li:has(.rec-thumbnail):not(.sm-btn-added), .watch-next-item:not(.sm-btn-added), .search-samples__item:not(.sm-btn-added), .search-result:not(.sm-btn-added)')
                 .forEach(el => {
+                    // Category grid cards: per-thumb buttons are handled by processCategoryThumbs, skip card-level buttons
+                    if (el.querySelector('.category-thumbs .thumb')) {
+                        el.classList.add('sm-btn-added');
+                        return;
+                    }
+
                     const ch = getChannelId(el);
                     const cr = getCreatorId(el);
                     const chName = getChannelName(el);
@@ -1567,6 +1823,7 @@
             processSpotlight(); // Run unconditionally so spotlight is evaluated even when flipstreams are hidden
             processEmbeds();
             processRelatedFlipnotes();
+            processCategoryThumbs();
             processGenealogy();
 
             // Safeguards to save resource cycles if Flipstreams are configured hidden
@@ -1583,7 +1840,8 @@
 
 
       GM_addStyle(`
-          .sm-btn-creator {
+          .sm-btn-creator,
+          .sm-btn-channel {
               position: absolute !important;
               top: 8px !important;
               right: 8px !important;
@@ -1615,9 +1873,36 @@
           .related-flipnote-container:hover .sm-btn-creator,
           .related-preview:hover .sm-btn-creator,
           .related-preview a:hover .sm-btn-creator,
-          .flipnote-genealogy-card:hover .sm-btn-creator {
+          .flipnote-genealogy-card:hover .sm-btn-creator,
+          /* Non-category channel cards: show channel hide on card hover */
+          .channel-card:not(:has(.category-thumbs)):hover .sm-btn-channel,
+          .cat-box:not(:has(.category-thumbs)):hover .sm-btn-channel {
               opacity: 1;
               display: flex;
+          }
+
+          /* Category grid: only show creator button on the specific thumb being hovered */
+          .category-thumbs .thumb:hover > .sm-btn-creator,
+          .category-thumbs .thumb:hover > a > .sm-btn-creator,
+          .category-thumbs .thumb a:hover > .sm-btn-creator {
+              opacity: 1;
+              display: flex;
+          }
+
+          /* Channel hide button should never appear inside category thumb strips */
+          .category-thumbs .sm-btn-channel,
+          .category-grid .category-thumbs .sm-btn-channel {
+              display: none !important;
+          }
+
+          .category-thumbs .thumb,
+          .category-thumbs .thumb a,
+          .category-thumbs .thumb a:has(img.flipnote-hoverpreview-img) {
+              position: relative !important;
+              display: inline-block;
+          }
+          .category-thumbs .thumb a img.flipnote-hoverpreview-img {
+              display: block;
           }
 
           /* Never show block button on blurred genealogy cards */
@@ -1627,7 +1912,8 @@
           }
 
           @media (max-width: 768px) {
-              .sm-btn-creator {
+              .sm-btn-creator,
+              .sm-btn-channel {
                   opacity: 1 !important;
                   display: flex !important;
                   width: 36px !important;
