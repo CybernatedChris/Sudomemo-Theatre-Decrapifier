@@ -5,7 +5,7 @@ A userscript that removes distractions and low quality off Sudomemo, such as cha
 We all change when we age and while it's true that there are kids roaming around Sudomemo, there is a good chance that one kid is under 13 years of age and of course this goes against Sudomemo's TOS. As a Hatena veteran and a decent returning Flipnote animator, it hurts my face when there are literal children making actual mind-numbing brainrot on there. And there are some channels that I dislike seeing, so there's that.
 
 ## Why not block the creators?
-Though it's efficient, if you don't want the creator to see you blocked them, this is a much more appropriate and suitable solution to hide creators. Besides, I don't see a report function of being under 13 anywhere and it's painful to do this under a DSi.
+Though it's efficient, if you don't want the creator to see you blocked them, this is a much more appropriate and suitable solution to hide creators. Besides, I don't see a report function of being under 13 anywhere and it's painful to do this under a DSi. Think of this like an unofficial "ignore" feature.
 
 ## How to download?
 1) Get a userscript manager, such as [Violentmonkey](https://violentmonkey.github.io)
