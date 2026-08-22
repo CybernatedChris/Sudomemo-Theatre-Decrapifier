@@ -20,8 +20,8 @@ Tap the hide button to hide the creator. Hold down the block button for 1 second
 
 You can hide channels by going to the categories, selecting one, then click on Hide on any channel.
 
-## Limitations
-You cannot hide Weekly Topics except for any other upcoming event such as FFC, FATE, or WCF, etc etc. You cannot hide yourself if you're logged in except for going in a private window and hiding yourself there.
+## Limitations & Known Issues
+You cannot hide Weekly Topics except for any other upcoming event such as FFC, FATE, or WCF, etc etc. You cannot hide yourself if you're logged in except for going in a private window and hiding yourself there. Non-hidden channels are hidden even though you didn't purposefully hide them.
 
 
 ## Preview Demo
