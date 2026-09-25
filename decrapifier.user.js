@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sudomemo Theatre Decrapifier
 // @namespace    http://tampermonkey.net/
-// @version      1
+// @version      1.1
 // @description  Clean up Sudomemo Theatre without blocking anyone (hiding upsells optional)
 // @match        https://www.sudomemo.net/*
 // @icon         https://icons.duckduckgo.com/ip3/sudomemo.net.ico
@@ -14,9 +14,9 @@
 (function() {
     'use strict';
 
-    const hideUpsells = GM_getValue('hideupsells', true);  // patreon, discord, sudomemo merchandise, uploading flipnotes as shorts
-    const hideGoodUpsells = GM_getValue('hidegoodupsells', true);  // wii room, 3ds guide, staying safe, organizer, archive, buy a creator theme
-    const hideFlipstreams = GM_getValue('hideflipstreams', true);  // hide flipstream
+    let hideUpsells = GM_getValue('hideupsells', true); // patreon, discord, sudomemo merchandise, uploading flipnotes as shorts
+    let hideGoodUpsells = GM_getValue('hidegoodupsells', true); // wii room, 3ds guide, staying safe, organizer, archive, buy a creator theme
+    let hideFlipstreams = GM_getValue('hideflipstreams', true); // hide flipstream
 
     if (location.pathname.startsWith('/chat') || location.pathname.startsWith('/watch/embed') || location.pathname.startsWith('/organizer')) return;
 
@@ -29,23 +29,67 @@
     let whitelistedcreators = [];
     const channelmap = new Map();
     const creatormap = new Map();
-    const creatorNameCache = new Map(); // Maps ID -> { name, avatar }
+    const creatorNameCache = new Map();
     let currentuser = null;
-    let longpresstimer = null;
-    let isRedirecting = false; // Flag to prevent multiple back/redirect triggers
-    let slideObserver = null; // Intersection observer for scroll bypass
+    let isRedirecting = false;
+    let slideObserver = null;
 
-    // Dynamic scroll direction tracking variables
     let lastScrollTop = 0;
     let scrollDirection = 'down';
-    let activeSlide = null; // Tracks the currently visible valid slide
+    let activeSlide = null;
+    let mutationDebounceTimer = null;
+
+    function isWeeklyTopicCategoryPage() {
+        return location.pathname.startsWith('/categories/8');
+    }
+
+    function escapeHTML(str) {
+        if (!str) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function cleanCreatorId(id) {
+        if (!id || typeof id !== 'string') return '';
+        const trimmed = id.trim().toUpperCase();
+        const hex = trimmed.split('@')[0].replace(/[^A-F0-9]/g, '');
+        if (hex.length === 16) return hex + '@DSI';
+        return '';
+    }
+
+    function detectCurrentUser() {
+        const navLink = document.querySelector('.navbar-nav a[href^="/user/"], nav a[href^="/user/"], .dropdown-menu a[href^="/user/"], #user-dropdown a[href^="/user/"], .user-menu a[href^="/user/"]');
+        const match = navLink?.href.match(/\/user\/([A-F0-9]{16}@DSi)/i);
+        currentuser = match ? cleanCreatorId(match[1]) : null;
+    }
+
+    function sanitizeList(arr, isCreator = false) {
+        if (!Array.isArray(arr)) return [];
+        return arr.filter(item => item && typeof item.id === 'string' && item.id.trim().length > 0).map(item => {
+            const cleanId = isCreator ? cleanCreatorId(item.id) : item.id.trim();
+            const cleanName = typeof item.name === 'string' ? item.name.trim().slice(0, 50) : 'Unknown';
+            let cleanAvatar = '';
+            if (isCreator && typeof item.avatar === 'string' && (item.avatar.startsWith('https://') || item.avatar.startsWith('/'))) {
+                cleanAvatar = item.avatar.trim();
+            }
+            return { id: cleanId, name: cleanName, avatar: cleanAvatar };
+        }).filter(item => item.id.length > 0);
+    }
 
     function loadSets() {
         try {
-            blockedchannels     = JSON.parse(GM_getValue(channelskey, '[]'));
-            blockedcreators     = JSON.parse(GM_getValue(creatorskey, '[]'));
-            whitelistedcreators = JSON.parse(GM_getValue(whitelistkey, '[]'));
-        } catch {}
+            blockedchannels     = sanitizeList(JSON.parse(GM_getValue(channelskey, '[]')), false);
+            blockedcreators     = sanitizeList(JSON.parse(GM_getValue(creatorskey, '[]')), true);
+            whitelistedcreators = sanitizeList(JSON.parse(GM_getValue(whitelistkey, '[]')), true);
+        } catch {
+            blockedchannels = [];
+            blockedcreators = [];
+            whitelistedcreators = [];
+        }
     }
 
     GM_addStyle(`
@@ -64,13 +108,11 @@
             border-radius: 0.25rem;
             color: #666;
         }
-        /* Keep layout dimension footprint so slides count/measurements don't break */
         .sm-blocked-slide {
             opacity: 0 !important;
             visibility: hidden !important;
             pointer-events: none !important;
         }
-        /* Blur effect for blocked genealogy cards (keeps layout, softens content) */
         .sm-blurred-genealogy {
             filter: blur(6px) !important;
             opacity: 0.55 !important;
@@ -79,7 +121,6 @@
             transition: none !important;
             animation: none !important;
         }
-        /* Fully block interaction + kill any transitions on blurred cards and children */
         .sm-blurred-genealogy,
         .sm-blurred-genealogy * {
             pointer-events: none !important;
@@ -87,24 +128,14 @@
             transition: none !important;
             animation: none !important;
         }
-        /* Hide any residual block button on blurred genealogy cards */
-        .sm-blurred-genealogy .sm-btn-creator {
-            display: none !important;
-        }
-        /* Never put buttons on collapsed group cards */
+        .sm-blurred-genealogy .sm-btn-creator,
         .flipnote-genealogy-card.collapsed-group .sm-btn-creator,
         .collapsed-group-content .sm-btn-creator,
         .collapsed-group-layout .sm-btn-creator {
             display: none !important;
         }
-        .flipnote-genealogy-card {
-            position: relative;
-        }
-        .related-preview a {
-            position: relative;
-            display: inline-block;
-        }
-        /* Force-hide blocked spinoff / related items */
+        .flipnote-genealogy-card { position: relative; }
+        .related-preview a { position: relative; display: inline-block; }
         .related-flipnote-container.sm-hidden,
         .spinoff-flipnote-list .related-flipnote-container.sm-hidden {
             display: none !important;
@@ -114,7 +145,6 @@
             margin: 0 !important;
             padding: 0 !important;
         }
-        /* Custom modal responsive container */
         .sm-dialog {
             background: #121212;
             color: #e0e0e0;
@@ -128,28 +158,11 @@
             overflow-y: auto;
         }
         @media (max-width: 576px) {
-            .sm-dialog {
-                padding: 1.25rem;
-                width: 100%;
-                max-width: 96%;
-            }
+            .sm-dialog { padding: 1.25rem; width: 100%; max-width: 96%; }
         }
-        /* Toggles layout styling */
-        .form-check-input {
-            cursor: pointer;
-            background-color: #222;
-            border-color: #555;
-        }
-        .form-check-input:checked {
-            background-color: #28a745;
-            border-color: #28a745;
-        }
-        .form-check-label {
-            cursor: pointer;
-            user-select: none;
-            color: #ccc;
-        }
-        /* Circular Help Badge */
+        .form-check-input { cursor: pointer; background-color: #222; border-color: #555; }
+        .form-check-input:checked { background-color: #28a745; border-color: #28a745; }
+        .form-check-label { cursor: pointer; user-select: none; color: #ccc; }
         .sm-help-badge {
             display: inline-flex;
             align-items: center;
@@ -167,32 +180,35 @@
             transition: background 0.2s, color 0.2s;
             vertical-align: middle;
         }
-        .sm-help-badge:hover {
-            background: #007bff;
-            color: #fff;
-        }
+        .sm-help-badge:hover { background: #007bff; color: #fff; }
     `);
 
     function saveblockedchannels()    { GM_setValue(channelskey,   JSON.stringify(blockedchannels)); }
     function saveblockedcreators()    { GM_setValue(creatorskey,   JSON.stringify(blockedcreators)); }
     function savewhitelistedcreators() { GM_setValue(whitelistkey, JSON.stringify(whitelistedcreators)); }
 
-    function getChannelId(el)   { return el.querySelector('a[href^="/channel/"]')?.href.match(/\/channel\/([a-zA-Z0-9]+)/)?.[1] ?? null; }
-    function getChannelName(el) { return el.querySelector('a[href^="/channel/"]')?.textContent?.trim() || ''; }
+    function getChannelId(el) {
+        if (!el) return null;
+        if (el.matches && el.matches('a[href^="/channel/"]')) {
+            return el.href.match(/\/channel\/([a-zA-Z0-9_-]+)/)?.[1] ?? null;
+        }
+        return el.querySelector('a[href^="/channel/"]')?.href.match(/\/channel\/([a-zA-Z0-9_-]+)/)?.[1] ?? null;
+    }
 
-    function getCreatorId(el)   {
-        // 1. Check for standard profile anchor link
-        let id = el.querySelector('a[href^="/user/"]')?.href.match(/\/user\/([A-F0-9]{16}@DSi)/i)?.[1]?.toUpperCase();
-        if (id) return id;
+    function getChannelName(el) {
+        return el.querySelector('a[href^="/channel/"]')?.textContent?.trim() || '';
+    }
 
-        // 2. Fallback: Parse path directories for nodes lacking profile links (e.g. search samples)
+    function getCreatorId(el) {
+        if (!el) return null;
+        const linkMatch = el.querySelector('a[href^="/user/"]')?.href.match(/\/user\/([A-F0-9]{16}@DSi)/i);
+        if (linkMatch) return cleanCreatorId(linkMatch[1]);
+
         const img = el.querySelector('img[src*="/dynamic/thumbframe/"], img[src*="/dynamic/playback/"]');
         if (img) {
             const src = img.getAttribute('src') || '';
             const match = src.match(/\/dynamic\/(?:thumbframe|playback)\/([A-F0-9]{16})/i);
-            if (match) {
-                return match[1].toUpperCase() + '@DSi';
-            }
+            if (match) return cleanCreatorId(match[1]);
         }
         return null;
     }
@@ -201,22 +217,14 @@
         const links = el.querySelectorAll('a[href^="/user/"]');
         for (const link of links) {
             const name = link.textContent?.trim();
-            // Skip anchor links that only wrap avatar image graphics
             if (name && !link.querySelector('img')) {
-                if (name.toLowerCase().startsWith('by ')) {
-                    return name.substring(3).trim();
-                }
-                return name;
+                return name.toLowerCase().startsWith('by ') ? name.substring(3).trim() : name;
             }
         }
-        let fallbackName = el.querySelector('a[href^="/user/"]')?.textContent?.trim() || '';
-        if (fallbackName.toLowerCase().startsWith('by ')) {
-            fallbackName = fallbackName.substring(3).trim();
-        }
-        return fallbackName;
+        let fallback = el.querySelector('a[href^="/user/"]')?.textContent?.trim() || '';
+        return fallback.toLowerCase().startsWith('by ') ? fallback.substring(3).trim() : fallback;
     }
 
-    // Redirection gatekeeper to ensure back or replace is called only once
     function safeRedirect() {
         if (isRedirecting) return;
         isRedirecting = true;
@@ -227,98 +235,127 @@
         }
     }
 
-    // Case-insensitive check utilities
-    function isWhitelisted(id) {
-        if (!id) return false;
-        const upperId = id.toUpperCase();
-        return whitelistedcreators.some(c => {
-            const cid = c.id || '';
-            return cid.toUpperCase() === upperId;
-        }) || upperId === currentuser?.toUpperCase();
-    }
-    function isBlockedCreator(id) {
-        if (!id) return false;
-        const upperId = id.toUpperCase();
-        return blockedcreators.some(c => {
-            const cid = c.id || '';
-            return cid.toUpperCase() === upperId;
-        }) && !isWhitelisted(upperId);
+    function isSelf(id) {
+        if (!id || !currentuser) return false;
+        return cleanCreatorId(id) === currentuser;
     }
 
-    // Matches extracted 6-hex-digit sequences against blocked creator suffixes
+    function isWhitelisted(id) {
+        if (!id) return false;
+        const cleaned = cleanCreatorId(id);
+        if (isSelf(cleaned)) return true;
+        return whitelistedcreators.some(c => cleanCreatorId(c.id) === cleaned);
+    }
+
+    function isBlockedCreator(id) {
+        if (!id) return false;
+        const cleaned = cleanCreatorId(id);
+        if (isSelf(cleaned)) return false;
+        return blockedcreators.some(c => cleanCreatorId(c.id) === cleaned) && !isWhitelisted(cleaned);
+    }
+
     function isLast6Blocked(last6) {
         if (!last6) return false;
         const upper6 = last6.toUpperCase();
+        if (currentuser) {
+            const myHex = currentuser.split('@')[0];
+            if (myHex.endsWith(upper6)) return false;
+        }
         return blockedcreators.some(c => {
-            const hexId = c.id.split('@')[0];
-            return hexId.toUpperCase().endsWith(upper6) && !isWhitelisted(c.id);
+            const hexId = cleanCreatorId(c.id).split('@')[0];
+            return hexId.endsWith(upper6) && !isWhitelisted(c.id);
         });
     }
 
-    // Scrapes the visible DOM to populate the name & avatar cache synchronously
     function harvestCreatorNames() {
+        let storageNeedsSave = false;
+
         document.querySelectorAll('a[href^="/user/"], a[href*="/user/"]').forEach(a => {
             const href = a.getAttribute('href') || '';
             const match = href.match(/\/user\/([A-F0-9]{16}@DSi)/i);
             if (match) {
-                const id = match[1].toUpperCase();
+                const id = cleanCreatorId(match[1]);
                 let name = a.textContent?.trim();
-                if (name && name.toLowerCase().startsWith('by ')) {
-                    name = name.substring(3).trim();
-                }
+                if (name && name.toLowerCase().startsWith('by ')) name = name.substring(3).trim();
+
                 if (name && name !== id && !name.includes('/') && !name.includes('@')) {
                     let avatarUrl = '';
                     const img = a.querySelector('img') || a.parentElement?.querySelector('img[src*="/dynamic/thumbframe/"]');
                     if (img) {
                         const src = img.getAttribute('src') || '';
                         if (src.includes('/dynamic/thumbframe/')) {
-                            avatarUrl = src;
+                            try {
+                                const urlObj = new URL(src.startsWith('/') ? 'https://www.sudomemo.net' + src : src);
+                                urlObj.searchParams.set('size', 's');
+                                urlObj.searchParams.set('square', '1');
+                                avatarUrl = urlObj.toString();
+                            } catch {
+                                avatarUrl = src;
+                            }
                         }
                     }
+
                     const existing = creatorNameCache.get(id);
-                    creatorNameCache.set(id, {
-                        name: name,
-                        avatar: avatarUrl || existing?.avatar || ''
+                    const finalAvatar = avatarUrl || existing?.avatar || '';
+
+                    creatorNameCache.set(id, { name: name, avatar: finalAvatar });
+
+                    [blockedcreators, whitelistedcreators].forEach(list => {
+                        const found = list.find(c => cleanCreatorId(c.id) === id);
+                        if (found) {
+                            if (name && found.name !== name && name !== 'Unknown') {
+                                found.name = name;
+                                storageNeedsSave = true;
+                            }
+                            if (avatarUrl && found.avatar !== avatarUrl) {
+                                found.avatar = avatarUrl;
+                                storageNeedsSave = true;
+                            }
+                        }
                     });
                 }
             }
         });
+
+        if (storageNeedsSave) {
+            saveblockedchannels();
+            savewhitelistedcreators();
+        }
     }
 
-    // Resolves names and avatar images dynamically using caching and DOM parsing
-    async function resolveCreatorName(id, callback) {
-        const upperId = id.toUpperCase();
+    async function resolveCreatorName(id, callback, forceRefresh = false) {
+        const cleanId = cleanCreatorId(id);
+        if (!cleanId) return;
 
-        // 1. Check local cache memory
-        if (creatorNameCache.has(upperId)) {
-            const cached = creatorNameCache.get(upperId);
-            callback(cached.name, cached.avatar);
-            return;
+        if (!forceRefresh) {
+            if (creatorNameCache.has(cleanId)) {
+                const cached = creatorNameCache.get(cleanId);
+                callback(cached.name, cached.avatar);
+                if (cached.avatar) return;
+            }
+
+            const blocked = blockedcreators.find(c => cleanCreatorId(c.id) === cleanId);
+            if (blocked && blocked.name && blocked.name !== 'Unknown') {
+                creatorNameCache.set(cleanId, { name: blocked.name, avatar: blocked.avatar || '' });
+                callback(blocked.name, blocked.avatar || '');
+                if (blocked.avatar) return;
+            }
+
+            const white = whitelistedcreators.find(c => cleanCreatorId(c.id) === cleanId);
+            if (white && white.name && white.name !== 'Unknown') {
+                creatorNameCache.set(cleanId, { name: white.name, avatar: white.avatar || '' });
+                callback(white.name, white.avatar || '');
+                if (white.avatar) return;
+            }
         }
 
-        // 2. Check loaded lists for already known properties
-        const blocked = blockedcreators.find(c => c.id.toUpperCase() === upperId);
-        if (blocked && blocked.name && blocked.name !== 'Unknown') {
-            creatorNameCache.set(upperId, { name: blocked.name, avatar: blocked.avatar || '' });
-            callback(blocked.name, blocked.avatar || '');
-            if (blocked.avatar) return;
-        }
-        const white = whitelistedcreators.find(c => c.id.toUpperCase() === upperId);
-        if (white && white.name && white.name !== 'Unknown') {
-            creatorNameCache.set(upperId, { name: white.name, avatar: white.avatar || '' });
-            callback(white.name, white.avatar || '');
-            if (white.avatar) return;
-        }
-
-        // 3. Fallback: Parse profile document dynamically (with lowercase @DSi to prevent routing errors)
         try {
-            const fetchId = upperId.replace('@DSI', '@DSi');
-            const res = await fetch(`/user/${fetchId}`);
+            const fetchId = cleanId.replace('@DSI', '@DSi');
+            const res = await fetch(`/user/${fetchId}`, { cache: 'no-cache' });
             if (!res.ok) return;
             const html = await res.text();
             const doc = new DOMParser().parseFromString(html, 'text/html');
 
-            // Extract display name from document title
             const title = doc.querySelector('title')?.textContent || '';
             let name = title
                 .replace(/'s Profile.*/i, '')
@@ -330,8 +367,7 @@
                 name = doc.querySelector('.profile-right .name a, .profile-right .name, h1, .name')?.textContent?.trim();
             }
 
-            // Target profile picture elements (including fallback static icons)
-            const hexId = upperId.split('@')[0];
+            const hexId = cleanId.split('@')[0];
             const avatarImg = doc.querySelector(`img[src*="/dynamic/thumbframe/${hexId}/"]`) ||
                               doc.querySelector('.details-profile-container img, .profile-avatar img, img.profile-avatar, .avatar img, img.avatar');
 
@@ -339,13 +375,10 @@
             if (avatarImg) {
                 let src = avatarImg.getAttribute('src') || '';
                 if (src) {
-                    if (src.startsWith('/')) {
-                        src = 'https://www.sudomemo.net' + src;
-                    }
+                    if (src.startsWith('/')) src = 'https://www.sudomemo.net' + src;
                     try {
                         const urlObj = new URL(src);
                         if (src.includes('/dynamic/thumbframe/')) {
-                            // Rescale query properties to render a small square preview icon
                             urlObj.searchParams.set('size', 's');
                             urlObj.searchParams.set('square', '1');
                         }
@@ -357,98 +390,101 @@
             }
 
             if (name && !name.includes('@')) {
-                creatorNameCache.set(upperId, { name, avatar: avatarUrl });
+                creatorNameCache.set(cleanId, { name, avatar: avatarUrl });
                 callback(name, avatarUrl);
 
-                // Commit parameters back into persistent storage
                 let updated = false;
                 blockedcreators.forEach(c => {
-                    if (c.id.toUpperCase() === upperId) {
-                        if (c.name === 'Unknown') { c.name = name; updated = true; }
-                        if (!c.avatar && avatarUrl) { c.avatar = avatarUrl; updated = true; }
+                    if (cleanCreatorId(c.id) === cleanId) {
+                        if (c.name !== name) { c.name = name; updated = true; }
+                        if (avatarUrl && c.avatar !== avatarUrl) { c.avatar = avatarUrl; updated = true; }
                     }
                 });
                 whitelistedcreators.forEach(c => {
-                    if (c.id.toUpperCase() === upperId) {
-                        if (c.name === 'Unknown') { c.name = name; updated = true; }
-                        if (!c.avatar && avatarUrl) { c.avatar = avatarUrl; updated = true; }
+                    if (cleanCreatorId(c.id) === cleanId) {
+                        if (c.name !== name) { c.name = name; updated = true; }
+                        if (avatarUrl && c.avatar !== avatarUrl) { c.avatar = avatarUrl; updated = true; }
                     }
                 });
                 if (updated) {
-                    saveblockedcreators();
+                    saveblockedchannels();
                     savewhitelistedcreators();
                 }
             }
-        } catch (e) {
-            console.error('[Decrapifier] Error fetching creator metadata:', e);
-        }
+        } catch {}
     }
 
-    function hide(el) { el.classList.add('sm-hidden'); el.style.display = 'none'; }
-    function show(el) { el.classList.remove('sm-hidden'); el.style.display = ''; }
+    function hide(el) {
+        if (!el) return;
+        el.classList.add('sm-hidden');
+        el.style.setProperty('display', 'none', 'important');
+    }
+
+    function show(el) {
+        if (!el) return;
+        el.classList.remove('sm-hidden');
+        el.style.display = '';
+    }
 
     function processItem(el) {
         if (el.classList.contains('sm-processed')) return;
         el.classList.add('sm-processed');
 
-        const chId = getChannelId(el);
-        const crId = getCreatorId(el);
+        const isChannelCard = el.matches('.channel-card, .cat-box, .channel-grid-item') ||
+                              el.classList.contains('channel-card') ||
+                              el.classList.contains('cat-box');
 
-        if (chId) {
-            if (!channelmap.has(chId)) channelmap.set(chId, new Set());
-            channelmap.get(chId).add(el);
-            if (blockedchannels.some(c => c.id.toUpperCase() === chId.toUpperCase())) hide(el);
-        }
-        if (crId) {
-            if (!creatormap.has(crId)) {
-                creatormap.set(crId, new Set());
+        if (isChannelCard) {
+            if (isWeeklyTopicCategoryPage()) {
+                show(el);
+                return;
             }
+            const chId = getChannelId(el);
+            if (chId) {
+                if (!channelmap.has(chId)) channelmap.set(chId, new Set());
+                channelmap.get(chId).add(el);
+                if (blockedchannels.some(c => c.id.toUpperCase() === chId.toUpperCase())) hide(el);
+            }
+            return;
+        }
+
+        const crId = getCreatorId(el);
+        if (crId) {
+            if (!creatormap.has(crId)) creatormap.set(crId, new Set());
             creatormap.get(crId).add(el);
             if (isBlockedCreator(crId)) hide(el);
         }
     }
 
     function processFlipstreams() {
-        if (hideFlipstreams) return; // Save processing cycles if globally hidden
+        if (hideFlipstreams) return;
         document.querySelectorAll('img.flipstream-thumbnail-card__image.flipnote-hoverpreview-img').forEach(img => {
             const src = img.getAttribute('src') || img.getAttribute('data-hover-preview-src') || '';
             const match = src.match(/\/dynamic\/(?:thumbframe|playback)\/([A-F0-9]{16})/i);
 
             if (match) {
-                const hexId = match[1].toUpperCase();
-                const creatorId = hexId + '@DSI';
-                const channelId = hexId;
-
+                const creatorId = cleanCreatorId(match[1]);
                 const li = img.closest('li.flipstream-list-item') || img.parentElement?.parentElement?.parentElement;
 
                 if (li) {
-                    if (!creatormap.has(creatorId)) {
-                        creatormap.set(creatorId, new Set());
-                    }
+                    if (!creatormap.has(creatorId)) creatormap.set(creatorId, new Set());
                     creatormap.get(creatorId).add(li);
 
-                    const isBlocked = isBlockedCreator(creatorId) || blockedchannels.some(c => c.id.toUpperCase() === channelId);
-
-                    if (isBlocked) {
-                        hide(li);
-                    } else {
-                        show(li);
-                    }
+                    const isBlocked = isBlockedCreator(creatorId);
+                    if (isBlocked) hide(li);
+                    else show(li);
 
                     if (!li.querySelector('.sm-btn-creator') && !li.classList.contains('sm-btn-added')) {
                         const isWhite = isWhitelisted(creatorId);
 
-                        // Only generate buttons for users other than yourself or manually whitelisted creators
-                        if (!isWhite && creatorId !== currentuser) {
+                        if (!isWhite && !isSelf(creatorId)) {
                             const cached = creatorNameCache.get(creatorId);
                             const initialName = cached?.name || 'Unknown';
-                            addBlockBtn(li, 'creator', creatorId, initialName, {blocked: isBlocked, whitelisted: false});
+                            addBlockBtn(li, 'creator', creatorId, initialName, { blocked: isBlocked, whitelisted: false });
 
                             resolveCreatorName(creatorId, (resolvedName) => {
                                 const btn = li.querySelector('.sm-btn-creator');
-                                if (btn) {
-                                    btn.title = `Hide ${resolvedName}`;
-                                }
+                                if (btn) btn.title = `Hide ${resolvedName}`;
                             });
                         }
                         li.classList.add('sm-btn-added');
@@ -458,140 +494,95 @@
         });
     }
 
-    // Inspects the Spotlight player component and hides the panel if the embedding URL belongs to a blocked ID
     function processSpotlight() {
         const header = document.querySelector('.panel-header-spotlight');
         if (header) {
-            const parentCard = header.closest('.card') || header.closest('.panel') || header.parentElement;
+            const parentCard = header.closest('.card, .panel') || header.parentElement;
             if (parentCard) {
                 const iframe = parentCard.querySelector('iframe[src*="/watch/embed/"]');
                 if (iframe) {
                     const src = iframe.getAttribute('src') || '';
                     const match = src.match(/\/watch\/embed\/([A-F0-9]{6})_/i);
-                    if (match) {
-                        const last6 = match[1].toUpperCase();
-                        if (isLast6Blocked(last6)) {
-                            hide(parentCard);
-                        } else {
-                            show(parentCard);
-                        }
-                    }
+                    if (match && isLast6Blocked(match[1])) hide(parentCard);
+                    else show(parentCard);
                 }
             }
         }
     }
 
-    // Identifies standalone embed frames and evaluates console prefixes to block/hide elements
     function processEmbeds() {
         document.querySelectorAll('.flipnote-embed').forEach(embed => {
             const iframe = embed.querySelector('iframe[src*="/watch/embed/"]');
             if (iframe) {
                 const src = iframe.getAttribute('src') || '';
                 const match = src.match(/\/watch\/embed\/([A-F0-9]{6})_/i);
-                if (match) {
-                    const last6 = match[1].toUpperCase();
-                    if (isLast6Blocked(last6)) {
-                        hide(embed);
-                    } else {
-                        show(embed);
-                    }
-                }
+                if (match && isLast6Blocked(match[1])) hide(embed);
+                else show(embed);
             }
         });
     }
 
-    // Handles related / spin-off flipnotes in the left sidebar
     function processRelatedFlipnotes() {
-        // Broad selector to catch all spinoff / related items
         const containers = document.querySelectorAll(
             '.related-flipnote-container, ' +
             '.spinoff-flipnote-list .related-flipnote-container, ' +
             '.spinoff-flipnote-list > div, ' +
-            '.theme-panel-body.spinoff-flipnote-list .related-flipnote-container'
+            '.theme-panel-body.spinoff-flipnote-list .related-flipnote-container, ' +
+            '#left-sidebar .related-flipnote-container, ' +
+            '#left-sidebar [class*="panel"] .related-flipnote-container'
         );
 
         containers.forEach(container => {
-            // Skip if this isn't actually a related item (avoid false positives)
-            if (!container.classList.contains('related-flipnote-container') &&
-                !container.querySelector('.related-preview, .related-title, .related-details')) {
-                return;
-            }
+            if (!container.classList.contains('related-flipnote-container') && !container.querySelector('.related-preview, .related-title, .related-details')) return;
 
             let creatorId = null;
             let creatorName = 'Unknown';
             let sixDigit = null;
 
-            // 1. Author / title link
-            const titleLink = container.querySelector(
-                'p.related-title a.theme-link[href*="/user/"], ' +
-                '.related-details a.theme-link[href*="/user/"], ' +
-                'a.theme-link[href*="/user/"], ' +
-                'a[href*="/user/"]'
-            );
+            const titleLink = container.querySelector('p.related-title a.theme-link[href*="/user/"], .related-details a.theme-link[href*="/user/"], a.theme-link[href*="/user/"], a[href*="/user/"]');
             if (titleLink) {
                 const match = (titleLink.getAttribute('href') || '').match(/\/user\/([A-F0-9]{16}@DSi)/i);
                 if (match) {
-                    creatorId = match[1].toUpperCase();
+                    creatorId = cleanCreatorId(match[1]);
                     creatorName = titleLink.textContent?.trim() || 'Unknown';
                     if (creatorName.toLowerCase().startsWith('by ')) creatorName = creatorName.substring(3).trim();
                 }
             }
 
-            // 2. Thumbnail src (thumbframe / playback often embeds the 16-char hex)
             if (!creatorId) {
-                const img = container.querySelector(
-                    'img[src*="/dynamic/thumbframe/"], img[src*="/dynamic/playback/"], ' +
-                    '.related-preview img, img'
-                );
+                const img = container.querySelector('img[src*="/dynamic/thumbframe/"], img[src*="/dynamic/playback/"], .related-preview img, img');
                 if (img) {
                     const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
                     const match = src.match(/\/dynamic\/(?:thumbframe|playback)\/([A-F0-9]{16})/i);
-                    if (match) {
-                        creatorId = match[1].toUpperCase() + '@DSi';
-                    } else {
-                        // Sometimes only 6 hex chars appear
+                    if (match) creatorId = cleanCreatorId(match[1]);
+                    else {
                         const sixMatch = src.match(/\/([A-F0-9]{6})(?:[\/_]|$)/i);
                         if (sixMatch) sixDigit = sixMatch[1].toUpperCase();
                     }
                 }
             }
 
-            // 3. Any watch / user link
             if (!creatorId) {
                 const anyLink = container.querySelector('a[href*="/watch/"], a[href*="/user/"]');
                 if (anyLink) {
                     const href = anyLink.getAttribute('href') || '';
                     let match = href.match(/\/user\/([A-F0-9]{16}@DSi)/i);
-                    if (match) {
-                        creatorId = match[1].toUpperCase();
-                    } else {
+                    if (match) creatorId = cleanCreatorId(match[1]);
+                    else {
                         match = href.match(/\/watch\/([A-F0-9]{6})/i) || href.match(/([A-F0-9]{6})_/);
                         if (match) sixDigit = match[1].toUpperCase();
                     }
                 }
             }
 
-            // 4. Resolve 6-digit against blocked list (first or last 6 of the 16-char hex)
             if (!creatorId && sixDigit) {
-                if (isLast6Blocked(sixDigit)) {
-                    const blocked = blockedcreators.find(c => {
-                        const hex = (c.id || '').split('@')[0].toUpperCase();
-                        return (hex.startsWith(sixDigit) || hex.endsWith(sixDigit)) && !isWhitelisted(c.id);
-                    });
-                    if (blocked) {
-                        creatorId = blocked.id.toUpperCase();
-                        creatorName = blocked.name || 'Unknown';
-                    }
-                } else {
-                    // Also check startsWith for first-6 matching
-                    const blocked = blockedcreators.find(c => {
-                        const hex = (c.id || '').split('@')[0].toUpperCase();
-                        return hex.startsWith(sixDigit) && !isWhitelisted(c.id);
-                    });
-                    if (blocked) {
-                        creatorId = blocked.id.toUpperCase();
-                        creatorName = blocked.name || 'Unknown';
-                    }
+                const blocked = blockedcreators.find(c => {
+                    const hex = cleanCreatorId(c.id).split('@')[0];
+                    return (hex.startsWith(sixDigit) || hex.endsWith(sixDigit)) && !isWhitelisted(c.id);
+                });
+                if (blocked) {
+                    creatorId = cleanCreatorId(blocked.id);
+                    creatorName = blocked.name || 'Unknown';
                 }
             }
 
@@ -607,163 +598,135 @@
 
             if (isBlocked) {
                 hide(container);
-                container.classList.add('sm-hidden');
-                container.style.display = 'none';
             } else {
                 show(container);
-                container.classList.remove('sm-hidden');
             }
 
-            // Place button on: .related-preview a  (the thumbnail link)
-            if (!container.querySelector('.sm-btn-creator') && !isWhite && creatorId !== currentuser && !isBlocked) {
+            if (!container.querySelector('.sm-btn-creator') && !isWhite && !isSelf(creatorId) && !isBlocked) {
                 addBlockBtn(container, 'creator', creatorId, creatorName, { blocked: isBlocked, whitelisted: false });
                 const btn = container.querySelector('.sm-btn-creator');
-                const thumbTarget = container.querySelector('.related-preview a') ||
-                                    container.querySelector('.related-preview') ||
-                                    container.querySelector('img')?.parentElement;
+                const thumbTarget = container.querySelector('.related-preview a, .related-preview') || container.querySelector('img')?.parentElement;
                 if (btn && thumbTarget) {
                     thumbTarget.style.position = 'relative';
-                    if (btn.parentElement !== thumbTarget) {
-                        thumbTarget.appendChild(btn);
-                    }
+                    if (btn.parentElement !== thumbTarget) thumbTarget.appendChild(btn);
                 }
             }
         });
     }
 
-    // Category grid: process EACH .category-thumbs .thumb individually (throttled)
-    let categoryThumbsLastRun = 0;
-    const CATEGORY_THUMBS_THROTTLE_MS = 1200;
+    let channelPreviewsLastRun = 0;
+    const CHANNEL_PREVIEWS_THROTTLE_MS = 1000;
 
-    function processCategoryThumbs(force = false) {
-        // Only run on pages that actually have category thumbs
-        if (!document.querySelector('.category-thumbs .thumb')) return;
-
+    function processChannelPreviews(force = false) {
         const now = Date.now();
-        if (!force && now - categoryThumbsLastRun < CATEGORY_THUMBS_THROTTLE_MS) return;
-        categoryThumbsLastRun = now;
+        if (!force && now - channelPreviewsLastRun < CHANNEL_PREVIEWS_THROTTLE_MS) return;
+        channelPreviewsLastRun = now;
 
-        // Remove stray channel-hide buttons inside category thumb strips (once per pass)
-        document.querySelectorAll('.category-thumbs .sm-btn-channel, .category-grid .sm-btn-channel')
-            .forEach(btn => btn.remove());
+        const onWeeklyTopics = isWeeklyTopicCategoryPage();
 
-        document.querySelectorAll('.category-thumbs .thumb').forEach(thumb => {
-            // Reuse cached creator id when possible
+        if (onWeeklyTopics) {
+            document.querySelectorAll('.sm-btn-channel').forEach(btn => btn.remove());
+        } else {
+            document.querySelectorAll('.category-thumbs .sm-btn-channel, .category-grid .sm-btn-channel').forEach(btn => btn.remove());
+        }
+
+        const previewImgs = document.querySelectorAll(
+            '.category-thumbs img, .channel-thumbs img, .cat-thumbs img, .cat-box .thumb img, ' +
+            '.channel-card .thumb img, .cat-box .category-thumbs img, .channel-card .category-thumbs img, ' +
+            '.category-grid img.flipnote-hoverpreview-img, [class*="channel"] .thumb img, [class*="cat-"] .thumb img'
+        );
+
+        previewImgs.forEach(img => {
+            const thumb = img.closest('.thumb') || img.closest('a') || img.parentElement;
+            if (!thumb) return;
+
+            const src = img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-hover-preview-src') || '';
+            const anchor = img.closest('a') || thumb.querySelector('a');
+            const href = anchor?.getAttribute('href') || '';
+            const combined = src + ' ' + href;
+
             let creatorId = thumb.dataset.smCreatorId || null;
-            let creatorName = thumb.dataset.smCreatorName || 'Unknown';
+            let sixDigit = thumb.dataset.smSix || null;
 
-            if (creatorId === '') return; // previously scanned, no id found
-
-            if (!creatorId) {
-                const img = thumb.querySelector('img.flipnote-hoverpreview-img, img[src*="/dynamic/thumbframe/"], img[src*="/dynamic/playback/"]');
-                if (img) {
-                    const src = img.getAttribute('src') || img.getAttribute('data-src') || img.getAttribute('data-hover-preview-src') || '';
-                    const match = src.match(/\/dynamic\/(?:thumbframe|playback)\/([A-F0-9]{16})/i);
-                    if (match) creatorId = match[1].toUpperCase() + '@DSi';
-                }
-
-                if (!creatorId) {
-                    const link = thumb.querySelector('a[href*="/user/"]');
-                    if (link) {
-                        const match = (link.getAttribute('href') || '').match(/\/user\/([A-F0-9]{16}@DSi)/i);
-                        if (match) creatorId = match[1].toUpperCase();
+            if (!creatorId && !sixDigit) {
+                const fullMatch = combined.match(/\/user\/([A-F0-9]{16}@DSi)/i) || combined.match(/\/dynamic\/(?:thumbframe|playback)\/([A-F0-9]{16})/i);
+                if (fullMatch) {
+                    creatorId = cleanCreatorId(fullMatch[1]);
+                    thumb.dataset.smCreatorId = creatorId;
+                } else {
+                    const sixMatch = combined.match(/\/watch\/([A-F0-9]{6})_/i) ||
+                                     combined.match(/\/dynamic\/(?:thumbframe|playback)\/([A-F0-9]{6})_/i) ||
+                                     combined.match(/([A-F0-9]{6})_[A-F0-9]{8,}/i) ||
+                                     combined.match(/\/watch\/([A-F0-9]{6})/i) ||
+                                     combined.match(/\/([A-F0-9]{6})(?:[\/_]|$)/i);
+                    if (sixMatch) {
+                        sixDigit = sixMatch[1].toUpperCase();
+                        thumb.dataset.smSix = sixDigit;
                     }
                 }
+            }
 
-                if (!creatorId) {
-                    thumb.dataset.smCreatorId = ''; // mark scanned
-                    return;
+            let isBlocked = false;
+            let isWhite = false;
+
+            if (creatorId) {
+                isBlocked = isBlockedCreator(creatorId);
+                isWhite = isWhitelisted(creatorId);
+            } else if (sixDigit) {
+                if (currentuser && currentuser.split('@')[0].endsWith(sixDigit)) {
+                    isWhite = true;
+                    isBlocked = false;
                 }
-
-                thumb.dataset.smCreatorId = creatorId;
-                thumb.dataset.smCreatorName = creatorName;
+                if (!isWhite) {
+                    if (isLast6Blocked(sixDigit)) {
+                        isBlocked = true;
+                    } else {
+                        const white = whitelistedcreators.find(c => cleanCreatorId(c.id).split('@')[0].endsWith(sixDigit));
+                        if (white) isWhite = true;
+                    }
+                }
             }
 
-            const isBlocked = isBlockedCreator(creatorId);
-            const isWhite = isWhitelisted(creatorId);
-            const wasHidden = thumb.classList.contains('sm-hidden');
-
-            // Only touch display when state changes
-            if (isBlocked && !wasHidden) {
-                thumb.style.display = 'none';
-                thumb.classList.add('sm-hidden');
-            } else if (!isBlocked && wasHidden) {
-                thumb.style.display = '';
-                thumb.classList.remove('sm-hidden');
+            if (isBlocked) {
+                hide(thumb);
+            } else {
+                show(thumb);
             }
 
-            if (isBlocked || creatorId === currentuser) {
+            if (isBlocked || (creatorId && isSelf(creatorId)) || (sixDigit && currentuser && currentuser.split('@')[0].endsWith(sixDigit))) {
                 const existing = thumb.querySelector('.sm-btn-creator');
                 if (existing) existing.remove();
                 return;
             }
 
-            let btn = thumb.querySelector('.sm-btn-creator');
-            if (!btn) {
-                btn = document.createElement('button');
-                btn.className = 'sm-btn-creator btn btn-sm btn-outline-danger';
-                btn.type = 'button';
-                btn.title = 'Hide creator (click) · Whitelist (right-click / long-press)';
-                btn.innerHTML = '<i class="fas fa-ban"></i>';
-                btn.dataset.smState = 'normal';
-
-                btn.onclick = e => {
-                    e.stopPropagation();
-                    e.preventDefault();
-                    const id = thumb.dataset.smCreatorId;
-                    const name = thumb.dataset.smCreatorName || 'Unknown';
-                    if (!id) return;
-                    const upperId = id.toUpperCase();
-                    if (whitelistedcreators.some(c => c.id.toUpperCase() === upperId)) {
-                        unwhitelistCreator(id);
-                    } else if (blockedcreators.some(c => c.id.toUpperCase() === upperId)) {
-                        unblockCreator(id);
-                    } else {
-                        blockCreator(id, name);
-                    }
-                    processCategoryThumbs(true);
-                };
-
-                const toggleWhitelist = () => {
-                    const id = thumb.dataset.smCreatorId;
-                    const name = thumb.dataset.smCreatorName || 'Unknown';
-                    if (!id) return;
-                    const upperId = id.toUpperCase();
-                    if (whitelistedcreators.some(c => c.id.toUpperCase() === upperId)) unwhitelistCreator(id);
-                    else whitelistCreator(id, name);
-                    processCategoryThumbs(true);
-                };
-                btn.addEventListener('mousedown', e => { if (e.button === 2) { e.preventDefault(); toggleWhitelist(); } });
-                btn.addEventListener('touchstart', () => { longpresstimer = setTimeout(toggleWhitelist, 600); });
-                btn.addEventListener('touchend', () => clearTimeout(longpresstimer));
-                btn.addEventListener('touchcancel', () => clearTimeout(longpresstimer));
-                btn.addEventListener('contextmenu', e => e.preventDefault());
-
-                const anchor = thumb.querySelector('a') || thumb;
-                anchor.style.position = 'relative';
-                if (anchor.tagName === 'A') anchor.style.display = 'inline-block';
-                anchor.appendChild(btn);
+            let resolvedId = creatorId;
+            let resolvedName = thumb.dataset.smCreatorName || 'Unknown';
+            if (!resolvedId && sixDigit) {
+                const matchCreator = blockedcreators.find(c => cleanCreatorId(c.id).split('@')[0].endsWith(sixDigit)) ||
+                                     whitelistedcreators.find(c => cleanCreatorId(c.id).split('@')[0].endsWith(sixDigit));
+                if (matchCreator) {
+                    resolvedId = cleanCreatorId(matchCreator.id);
+                    resolvedName = matchCreator.name || 'Unknown';
+                }
             }
 
-            // Update icon only when whitelist state changes
-            const wantState = isWhite ? 'white' : 'normal';
-            if (btn.dataset.smState !== wantState) {
-                btn.dataset.smState = wantState;
-                if (isWhite) {
-                    btn.className = 'sm-btn-creator btn btn-sm btn-success';
-                    btn.title = 'Remove whitelist (click)';
-                    btn.innerHTML = '<i class="fas fa-star"></i>';
+            if (resolvedId && !isSelf(resolvedId)) {
+                let btn = thumb.querySelector('.sm-btn-creator');
+                if (!btn) {
+                    addBlockBtn(thumb, 'creator', resolvedId, resolvedName, { blocked: false, whitelisted: isWhite });
                 } else {
-                    btn.className = 'sm-btn-creator btn btn-sm btn-outline-danger';
-                    btn.title = 'Hide creator (click) · Whitelist (right-click / long-press)';
-                    btn.innerHTML = '<i class="fas fa-ban"></i>';
+                    const wantState = isWhite ? 'white' : 'normal';
+                    if (btn.dataset.smState !== wantState) {
+                        btn.dataset.smState = wantState;
+                        btn.className = `sm-btn-creator btn btn-sm ${isWhite ? 'btn-success' : 'btn-outline-danger'}`;
+                        btn.title = isWhite ? 'Remove whitelist (click), Whitelist (right-click / long-press)' : 'Hide creator (click), Whitelist (right-click / long-press)';
+                        btn.innerHTML = isWhite ? '<i class="fas fa-star"></i>' : '<i class="fas fa-ban"></i>';
+                    }
                 }
             }
         });
     }
 
-    // Genealogy tree: blur blocked creators instead of hiding, add block/whitelist buttons
-    // Heavily optimized, only runs when genealogy is present and only processes new/changed cards
     let genealogyLastRun = 0;
     const GENEALOGY_THROTTLE_MS = 800;
 
@@ -772,27 +735,23 @@
         if (!force && now - genealogyLastRun < GENEALOGY_THROTTLE_MS) return;
 
         const root = document.getElementById('genealogy-nodes') || document.querySelector('.flipnote-genealogy-tree');
-        if (!root) return; // nothing to do on pages without genealogy
+        if (!root) return;
 
         genealogyLastRun = now;
-
         const cards = root.querySelectorAll('.flipnote-genealogy-card');
         if (!cards.length) return;
 
         cards.forEach(card => {
-            // Skip cards we already fully processed unless force-refreshing block state
             let creatorId = card.dataset.smCreatorId || null;
             let creatorName = card.dataset.smCreatorName || 'Unknown';
 
             if (!creatorId) {
-                // One-time extraction
                 const nodeId = card.getAttribute('data-node-id') || '';
-
                 const userLink = card.querySelector('a[href^="/user/"]');
                 if (userLink) {
                     const match = userLink.href.match(/\/user\/([A-F0-9]{16}@DSi)/i);
                     if (match) {
-                        creatorId = match[1].toUpperCase();
+                        creatorId = cleanCreatorId(match[1]);
                         const txt = userLink.textContent?.trim();
                         if (txt && !userLink.querySelector('img')) {
                             creatorName = txt.toLowerCase().startsWith('by ') ? txt.substring(3).trim() : txt;
@@ -805,7 +764,7 @@
                     if (img) {
                         const src = img.getAttribute('src') || '';
                         const match = src.match(/\/dynamic\/(?:thumbframe|playback)\/([A-F0-9]{16})/i);
-                        if (match) creatorId = match[1].toUpperCase() + '@DSi';
+                        if (match) creatorId = cleanCreatorId(match[1]);
                     }
                 }
 
@@ -813,18 +772,14 @@
                     const watchLink = card.querySelector('a[href*="/watch/"]');
                     const candidate = (watchLink?.getAttribute('href') || '') + ' ' + nodeId;
                     let match = candidate.match(/\/user\/([A-F0-9]{16}@DSi)/i);
-                    if (match) {
-                        creatorId = match[1].toUpperCase();
-                    } else {
+                    if (match) creatorId = cleanCreatorId(match[1]);
+                    else {
                         match = candidate.match(/([A-F0-9]{6})/);
                         if (match) {
                             const six = match[1].toUpperCase();
-                            const blocked = blockedcreators.find(c => {
-                                const hex = (c.id || '').split('@')[0].toUpperCase();
-                                return (hex.startsWith(six) || hex.endsWith(six)) && !isWhitelisted(c.id);
-                            });
+                            const blocked = blockedcreators.find(c => cleanCreatorId(c.id).split('@')[0].endsWith(six) && !isWhitelisted(c.id));
                             if (blocked) {
-                                creatorId = blocked.id.toUpperCase();
+                                creatorId = cleanCreatorId(blocked.id);
                                 creatorName = blocked.name || 'Unknown';
                             }
                         }
@@ -832,7 +787,7 @@
                 }
 
                 if (!creatorId) {
-                    card.dataset.smCreatorId = ''; // mark as checked so we don't retry forever
+                    card.dataset.smCreatorId = '';
                     return;
                 }
 
@@ -851,188 +806,228 @@
             const isWhite = isWhitelisted(creatorId);
             const wasBlurred = card.classList.contains('sm-blurred-genealogy');
 
-            // Instant blur
             if (isBlocked && !wasBlurred) {
-                card.style.transition = 'none';
-                card.style.animation = 'none';
                 card.classList.add('sm-blurred-genealogy');
-                card.style.filter = 'blur(6px)';
-                card.style.opacity = '0.55';
-                card.style.pointerEvents = 'none';
-                // Neutralize all links so they cannot navigate
                 card.querySelectorAll('a').forEach(a => {
                     a.dataset.smOrigHref = a.getAttribute('href') || '';
                     a.removeAttribute('href');
-                    a.style.pointerEvents = 'none';
-                    a.style.cursor = 'default';
-                    a.style.transition = 'none';
                 });
             } else if (!isBlocked && wasBlurred) {
                 card.classList.remove('sm-blurred-genealogy');
-                card.style.filter = '';
-                card.style.opacity = '';
-                card.style.pointerEvents = '';
-                card.style.transition = '';
-                card.style.animation = '';
-                // Restore links
                 card.querySelectorAll('a[data-sm-orig-href]').forEach(a => {
                     a.setAttribute('href', a.dataset.smOrigHref);
                     delete a.dataset.smOrigHref;
-                    a.style.pointerEvents = '';
-                    a.style.cursor = '';
-                    a.style.transition = '';
                 });
             }
 
-            // Skip block buttons on collapsed group cards and already-blocked cards
-            const isCollapsedGroup = card.classList.contains('collapsed-group') ||
-                                     card.classList.contains('collapsed-group-layout') ||
-                                     !!card.querySelector('.collapsed-group-content');
+            const isCollapsedGroup = card.classList.contains('collapsed-group') || card.classList.contains('collapsed-group-layout') || !!card.querySelector('.collapsed-group-content');
 
-            if (isBlocked || isCollapsedGroup) {
+            if (isBlocked || isCollapsedGroup || isSelf(creatorId)) {
                 const existingBtn = card.querySelector('.sm-btn-creator');
                 if (existingBtn) existingBtn.remove();
-            } else if (!card.querySelector('.sm-btn-creator') && !isWhite && creatorId !== currentuser) {
-                // Only add button for non-blocked, non-collapsed, non-whitelisted creators
+            } else if (!card.querySelector('.sm-btn-creator') && !isWhite) {
                 addBlockBtn(card, 'creator', creatorId, creatorName, { blocked: false, whitelisted: false });
-                const btn = card.querySelector('.sm-btn-creator');
-                if (btn) {
-                    btn.style.zIndex = '20';
-                }
             }
         });
 
-        // Remove blocked creators from collapsed-group thumbnail strips
-        root.querySelectorAll(
-            '.flipnote-genealogy-card.collapsed-group .collapsed-group-thumbnails img.collapsed-group-thumb, ' +
-            '.collapsed-group-layout .collapsed-group-content img.collapsed-group-thumb, ' +
-            '.collapsed-group-thumbnails img.collapsed-group-thumb'
-        ).forEach(img => {
+        root.querySelectorAll('.flipnote-genealogy-card.collapsed-group img.collapsed-group-thumb, .collapsed-group-layout img.collapsed-group-thumb, .collapsed-group-thumbnails img.collapsed-group-thumb').forEach(img => {
             const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
             let blocked = false;
 
-            // Match full 16-char hex from thumbframe/playback path
             const fullMatch = src.match(/\/dynamic\/(?:thumbframe|playback)\/([A-F0-9]{16})/i);
-            if (fullMatch) {
-                const id = fullMatch[1].toUpperCase() + '@DSi';
-                if (isBlockedCreator(id)) blocked = true;
-            }
+            if (fullMatch && isBlockedCreator(cleanCreatorId(fullMatch[1]))) blocked = true;
 
-            // Fallback: 6-digit segment (first or last 6 of blocked creator hex)
             if (!blocked) {
                 const sixMatch = src.match(/([A-F0-9]{6})/i);
-                if (sixMatch) {
-                    const six = sixMatch[1].toUpperCase();
-                    if (isLast6Blocked(six) || blockedcreators.some(c => {
-                        const hex = (c.id || '').split('@')[0].toUpperCase();
-                        return (hex.startsWith(six) || hex.endsWith(six)) && !isWhitelisted(c.id);
-                    })) {
-                        blocked = true;
-                    }
-                }
+                if (sixMatch && isLast6Blocked(sixMatch[1])) blocked = true;
             }
 
-            // Also check parent link if present
             if (!blocked) {
                 const link = img.closest('a[href*="/user/"], a[href*="/watch/"]');
                 if (link) {
                     const href = link.getAttribute('href') || '';
                     const userMatch = href.match(/\/user\/([A-F0-9]{16}@DSi)/i);
-                    if (userMatch && isBlockedCreator(userMatch[1].toUpperCase())) {
-                        blocked = true;
-                    } else {
+                    if (userMatch && isBlockedCreator(cleanCreatorId(userMatch[1]))) blocked = true;
+                    else {
                         const watchMatch = href.match(/\/watch\/([A-F0-9]{6})/i) || href.match(/([A-F0-9]{6})_/);
-                        if (watchMatch) {
-                            const six = watchMatch[1].toUpperCase();
-                            if (isLast6Blocked(six) || blockedcreators.some(c => {
-                                const hex = (c.id || '').split('@')[0].toUpperCase();
-                                return (hex.startsWith(six) || hex.endsWith(six)) && !isWhitelisted(c.id);
-                            })) {
-                                blocked = true;
-                            }
-                        }
+                        if (watchMatch && isLast6Blocked(watchMatch[1])) blocked = true;
                     }
                 }
             }
 
             if (blocked) {
-                img.style.display = 'none';
-                img.classList.add('sm-hidden');
-                // Hide wrapper if it's just a single-thumb link/container
-                const wrap = img.closest('a, .collapsed-group-thumb-wrap, li');
-                if (wrap && wrap !== img.parentElement?.closest('.collapsed-group-thumbnails')) {
-                    wrap.style.display = 'none';
-                    wrap.classList.add('sm-hidden');
-                }
+                hide(img);
             } else {
-                img.style.display = '';
-                img.classList.remove('sm-hidden');
+                show(img);
             }
         });
     }
 
-    // Programmatically skips past a blocked slide element in the active direction
+    function processEmptyCards() {
+        const trendingItems = document.querySelectorAll('.trending-user, [class*="trending-user"]');
+        if (trendingItems.length > 0) {
+            const trendingCards = new Set();
+            trendingItems.forEach(item => {
+                const card = item.closest('.card, .panel, .panel-common, .theme-panel') || item.parentElement?.closest('div');
+                if (card) trendingCards.add(card);
+            });
+
+            trendingCards.forEach(card => {
+                const items = card.querySelectorAll('.trending-user, [class*="trending-user"], a[href*="/user/"]');
+                const visible = Array.from(items).filter(el => {
+                    if (el.classList.contains('sm-hidden') || el.style.display === 'none') return false;
+                    if (el.closest('.sm-hidden')) return false;
+                    return true;
+                });
+
+                if (visible.length === 0) {
+                    hide(card);
+                    const col = card.closest('.col, [class*="col-"]');
+                    if (col && !col.querySelector('.card:not(.sm-hidden), .panel:not(.sm-hidden), .news-item')) hide(col);
+                } else {
+                    show(card);
+                    const col = card.closest('.col, [class*="col-"]');
+                    if (col) show(col);
+                }
+            });
+        }
+
+        const originalHeaders = Array.from(document.querySelectorAll(
+            '#left-sidebar .theme-panel-header, #left-sidebar [class*="header"], #left-sidebar [class*="heading"], ' +
+            '.theme-panel-header, .panel-header, .card-header'
+        )).filter(h => {
+            const txt = h.textContent?.trim() || '';
+            return /original/i.test(txt) && !/character|creation/i.test(txt);
+        });
+
+        originalHeaders.forEach(header => {
+            const container = header.parentElement;
+            const body = header.nextElementSibling || container?.querySelector('.theme-panel-body, [class*="body"]');
+            const wrapper = container?.closest('.col-12, [class*="col-"]');
+            const searchTarget = body || container;
+
+            let isBlocked = false;
+
+            const userLink = searchTarget?.querySelector('a[href^="/user/"], a[href*="/user/"]');
+            if (userLink) {
+                const match = userLink.href.match(/\/user\/([A-F0-9]{16}@DSi)/i);
+                if (match && isBlockedCreator(cleanCreatorId(match[1]))) isBlocked = true;
+            }
+
+            if (!isBlocked && searchTarget) {
+                const img = searchTarget.querySelector('img[src*="thumbframe"], img[src*="playback"], img');
+                const watchLink = searchTarget.querySelector('a[href*="/watch/"]');
+                const combined = (img?.getAttribute('src') || '') + ' ' + (watchLink?.getAttribute('href') || '');
+
+                const fullMatch = combined.match(/\/dynamic\/(?:thumbframe|playback)\/([A-F0-9]{16})/i);
+                if (fullMatch && isBlockedCreator(cleanCreatorId(fullMatch[1]))) {
+                    isBlocked = true;
+                } else {
+                    const sixMatch = combined.match(/([A-F0-9]{6})_/i) || combined.match(/\/watch\/([A-F0-9]{6})/i);
+                    if (sixMatch && isLast6Blocked(sixMatch[1])) isBlocked = true;
+                }
+            }
+
+            const hasPreview = searchTarget?.querySelector('img, a[href*="/watch/"]');
+
+            if (isBlocked || !hasPreview) {
+                hide(header);
+                if (body) hide(body);
+                if (container && container !== document.body && container.id !== 'left-sidebar') hide(container);
+                if (wrapper && wrapper.parentElement?.id === 'left-sidebar') hide(wrapper);
+            } else {
+                show(header);
+                if (body) show(body);
+                if (container) show(container);
+                if (wrapper && wrapper.parentElement?.id === 'left-sidebar') show(wrapper);
+            }
+        });
+
+        const spinoffHeaders = Array.from(document.querySelectorAll(
+            '#left-sidebar .theme-panel-header, #left-sidebar [class*="header"], #left-sidebar [class*="heading"], ' +
+            '.theme-panel-header, .panel-header, .card-header'
+        )).filter(h => {
+            const txt = h.textContent?.trim() || '';
+            return /spinoff/i.test(txt);
+        });
+
+        const spinoffContainers = new Set();
+        spinoffHeaders.forEach(h => { if (h.parentElement) spinoffContainers.add(h.parentElement); });
+        document.querySelectorAll('.spinoff-flipnote-list, [class*="spinoff-list"], #spinoff-list').forEach(l => {
+            if (l.parentElement) spinoffContainers.add(l.parentElement);
+        });
+
+        spinoffContainers.forEach(container => {
+            const header = container.querySelector('[class*="header"], [class*="heading"], h1, h2, h3, h4, h5, h6') || container.previousElementSibling;
+            const list = container.querySelector('.spinoff-flipnote-list, [class*="spinoff-list"]') || container;
+            const wrapper = container.closest('.col-12, [class*="col-"]');
+            const items = container.querySelectorAll('.related-flipnote-container, .related-preview, a[href*="/watch/"]');
+
+            items.forEach(item => {
+                let blocked = item.classList.contains('sm-hidden') || item.style.display === 'none';
+                if (!blocked) {
+                    const crId = getCreatorId(item);
+                    if (crId && isBlockedCreator(crId)) {
+                        blocked = true;
+                        hide(item);
+                    } else {
+                        const img = item.querySelector('img');
+                        const a = item.matches('a') ? item : item.querySelector('a');
+                        const combined = (img?.getAttribute('src') || '') + ' ' + (a?.getAttribute('href') || '');
+                        const sixMatch = combined.match(/([A-F0-9]{6})_/i) || combined.match(/\/watch\/([A-F0-9]{6})/i);
+                        if (sixMatch && isLast6Blocked(sixMatch[1])) {
+                            blocked = true;
+                            hide(item);
+                        }
+                    }
+                }
+            });
+
+            const visibleItems = Array.from(items).filter(el => {
+                if (el.classList.contains('sm-hidden') || el.style.display === 'none') return false;
+                if (el.closest('.sm-hidden')) return false;
+                return el.querySelector('img') || el.matches('a:has(img)');
+            });
+
+            if (visibleItems.length === 0) {
+                if (header) hide(header);
+                hide(list);
+                if (container && container !== document.body && container.id !== 'left-sidebar') hide(container);
+                if (wrapper && wrapper.parentElement?.id === 'left-sidebar') hide(wrapper);
+            } else {
+                if (header) show(header);
+                show(list);
+                if (container) show(container);
+                if (wrapper && wrapper.parentElement?.id === 'left-sidebar') show(wrapper);
+            }
+        });
+    }
+
     function skipBlockedSlide(slide, forceDirection = null) {
         if (!slide) return;
         const creatorId = slide.dataset.creatorId;
         if (!creatorId) return;
 
-        const hexId = creatorId.split('@')[0];
-        const isBlocked = isBlockedCreator(creatorId) || blockedchannels.some(c => c.id.toUpperCase() === hexId);
-
-        if (isBlocked) {
+        if (isBlockedCreator(creatorId)) {
             const dir = forceDirection || scrollDirection;
+            let targetSlide = dir === 'down' ? slide.nextElementSibling : slide.previousElementSibling;
 
-            if (dir === 'down') {
-                // Find and snap to the next unblocked slide below
-                let nextSlide = slide.nextElementSibling;
-                while (nextSlide) {
-                    if (nextSlide.matches('.flipstream-slide')) {
-                        const nextCreatorLink = nextSlide.querySelector('a.flipstream-creator-link[href^="/user/"]');
-                        const nextCreatorId = nextCreatorLink?.href.match(/\/user\/([A-F0-9]{16}@DSi)/i)?.[1]?.toUpperCase();
-                        if (nextCreatorId) {
-                            const nextHexId = nextCreatorId.split('@')[0];
-                            const nextBlocked = isBlockedCreator(nextCreatorId) || blockedchannels.some(c => c.id.toUpperCase() === nextHexId);
-                            if (!nextBlocked) {
-                                break;
-                            }
-                        }
-                    }
-                    nextSlide = nextSlide.nextElementSibling;
+            while (targetSlide) {
+                if (targetSlide.matches('.flipstream-slide')) {
+                    const nextLink = targetSlide.querySelector('a.flipstream-creator-link[href^="/user/"]');
+                    const nextId = nextLink?.href.match(/\/user\/([A-F0-9]{16}@DSi)/i)?.[1];
+                    if (nextId && !isBlockedCreator(cleanCreatorId(nextId))) break;
                 }
-
-                if (nextSlide) {
-                    nextSlide.scrollIntoView({ behavior: 'auto', block: 'start' });
-                }
-            } else {
-                // Find and snap to the first unblocked slide above
-                let prevSlide = slide.previousElementSibling;
-                while (prevSlide) {
-                    if (prevSlide.matches('.flipstream-slide')) {
-                        const prevCreatorLink = prevSlide.querySelector('a.flipstream-creator-link[href^="/user/"]');
-                        const prevCreatorId = prevCreatorLink?.href.match(/\/user\/([A-F0-9]{16}@DSi)/i)?.[1]?.toUpperCase();
-                        if (prevCreatorId) {
-                            const prevHexId = prevCreatorId.split('@')[0];
-                            const prevBlocked = isBlockedCreator(prevCreatorId) || blockedchannels.some(c => c.id.toUpperCase() === prevHexId);
-                            if (!prevBlocked) {
-                                break;
-                            }
-                        }
-                    }
-                    prevSlide = prevSlide.previousElementSibling;
-                }
-                if (prevSlide) {
-                    prevSlide.scrollIntoView({ behavior: 'auto', block: 'start' });
-                }
+                targetSlide = dir === 'down' ? targetSlide.nextElementSibling : targetSlide.previousElementSibling;
             }
+
+            if (targetSlide) targetSlide.scrollIntoView({ behavior: 'auto', block: 'start' });
         }
     }
 
-    // Instantiates a scrolling observer to dynamically bypass blocked slides
     function initSlideObserver() {
         if (slideObserver) return;
 
-        // Track the general direction of native page scrolls
         document.addEventListener('scroll', (e) => {
             const target = e.target === document ? document.documentElement : e.target;
             const scrollTop = target.scrollTop !== undefined ? target.scrollTop : window.scrollY;
@@ -1047,12 +1042,8 @@
                 if (entry.isIntersecting) {
                     const slide = entry.target;
                     const creatorId = slide.dataset.creatorId;
-
                     if (creatorId) {
-                        const hexId = creatorId.split('@')[0];
-                        const isBlocked = isBlockedCreator(creatorId) || blockedchannels.some(c => c.id.toUpperCase() === hexId);
-
-                        if (!isBlocked) {
+                        if (!isBlockedCreator(creatorId)) {
                             activeSlide = slide;
                             updateTopbarButton();
                         } else {
@@ -1061,32 +1052,19 @@
                     }
                 }
             });
-        }, {
-            threshold: 0.15 // Fire early when even 15% of the slide enters viewport coordinates
-        });
+        }, { threshold: 0.15 });
     }
 
-    // Evaluates dynamic button icon/color states on the topbar action element
     function updateTopbarButton() {
         const btn = document.getElementById('sm-topbar-btn');
         if (!btn) return;
 
-        // Fallback: If the observer has not yet registered an event, find the first active, non-blocked slide
-        if (!activeSlide) {
-            activeSlide = document.querySelector('article.flipstream-slide:not(.sm-blocked-slide)');
-        }
-
-        if (!activeSlide) {
-            btn.style.display = 'none';
-            return;
-        }
-        btn.style.display = '';
+        if (!activeSlide) activeSlide = document.querySelector('article.flipstream-slide:not(.sm-blocked-slide)');
+        if (!activeSlide) { btn.style.display = 'none'; return; }
 
         const creatorId = activeSlide.dataset.creatorId;
-        if (!creatorId) {
-            btn.style.display = 'none';
-            return;
-        }
+        if (!creatorId || isSelf(creatorId)) { btn.style.display = 'none'; return; }
+        btn.style.display = '';
 
         const isWhite = isWhitelisted(creatorId);
         const isBlocked = isBlockedCreator(creatorId);
@@ -1103,7 +1081,6 @@
         }
     }
 
-    // Appends the interactive icon action inside the navigation bar
     function injectTopbarButton() {
         if (document.getElementById('sm-topbar-btn')) return;
         const container = document.querySelector('.flipstream-topbar-actions');
@@ -1119,92 +1096,77 @@
             e.stopPropagation();
             if (!activeSlide) return;
             const creatorId = activeSlide.dataset.creatorId;
-            if (!creatorId) return;
+            if (!creatorId || isSelf(creatorId)) return;
 
             const cached = creatorNameCache.get(creatorId);
             const name = cached?.name || 'Unknown';
 
-            const isWhite = whitelistedcreators.some(c => c.id.toUpperCase() === creatorId);
-            const isBlocked = blockedcreators.some(c => c.id.toUpperCase() === creatorId);
-
-            if (isWhite) {
+            if (whitelistedcreators.some(c => cleanCreatorId(c.id) === creatorId)) {
                 unwhitelistCreator(creatorId);
-            } else if (isBlocked) {
+            } else if (blockedcreators.some(c => cleanCreatorId(c.id) === creatorId)) {
                 unblockCreator(creatorId);
             } else {
                 blockCreator(creatorId, name);
             }
-            processFlipstreamSlides(); // Sync skips and mutations instantly on click
-            skipBlockedSlide(activeSlide, 'down'); // Instantly force-skip the slide downward on blocking
+            processFlipstreamSlides();
+            skipBlockedSlide(activeSlide, 'down');
             updateTopbarButton();
         };
 
-        // Long press / right click logic for whitelisting
         const toggleWhitelist = () => {
             if (!activeSlide) return;
             const creatorId = activeSlide.dataset.creatorId;
-            if (!creatorId) return;
+            if (!creatorId || isSelf(creatorId)) return;
 
             const cached = creatorNameCache.get(creatorId);
             const name = cached?.name || 'Unknown';
 
-            const isWhite = whitelistedcreators.some(c => c.id.toUpperCase() === creatorId);
-            if (isWhite) unwhitelistCreator(creatorId);
+            if (whitelistedcreators.some(c => cleanCreatorId(c.id) === creatorId)) unwhitelistCreator(creatorId);
             else whitelistCreator(creatorId, name);
-            processFlipstreamSlides(); // Sync skips and mutations instantly on click
+
+            processFlipstreamSlides();
             updateTopbarButton();
         };
 
+        let pressTimer = null;
         btn.addEventListener('mousedown', e => { if (e.button === 2) { e.preventDefault(); toggleWhitelist(); } });
-        btn.addEventListener('touchstart', () => { longpresstimer = setTimeout(toggleWhitelist, 600); });
-        btn.addEventListener('touchend', () => clearTimeout(longpresstimer));
-        btn.addEventListener('touchcancel', () => clearTimeout(longpresstimer));
+        btn.addEventListener('touchstart', () => { pressTimer = setTimeout(toggleWhitelist, 600); });
+        btn.addEventListener('touchend', () => clearTimeout(pressTimer));
+        btn.addEventListener('touchcancel', () => clearTimeout(pressTimer));
         btn.addEventListener('contextmenu', e => e.preventDefault());
 
         container.appendChild(btn);
         updateTopbarButton();
     }
 
-    // Processes standard slide posts on the /flipstream viewing page
     function processFlipstreamSlides() {
-        if (hideFlipstreams) return; // Exit early if we are hiding/blocking flipstreams anyway
+        if (hideFlipstreams) return;
         initSlideObserver();
         injectTopbarButton();
 
         document.querySelectorAll('article.flipstream-slide').forEach(slide => {
             const creatorLink = slide.querySelector('a.flipstream-creator-link[href^="/user/"]');
             if (creatorLink) {
-                const creatorId = creatorLink.href.match(/\/user\/([A-F0-9]{16}@DSi)/i)?.[1]?.toUpperCase();
-                if (creatorId) {
+                const match = creatorLink.href.match(/\/user\/([A-F0-9]{16}@DSi)/i);
+                if (match) {
+                    const creatorId = cleanCreatorId(match[1]);
                     slide.dataset.creatorId = creatorId;
 
                     const name = creatorLink.textContent?.trim() || '';
                     const avatarImg = slide.querySelector('img.flipstream-avatar');
                     let avatar = avatarImg?.getAttribute('src') || '';
-                    if (avatar && avatar.startsWith('/')) {
-                        avatar = 'https://www.sudomemo.net' + avatar;
-                    }
+                    if (avatar && avatar.startsWith('/')) avatar = 'https://www.sudomemo.net' + avatar;
 
-                    if (name && !creatorNameCache.has(creatorId)) {
-                        creatorNameCache.set(creatorId, { name, avatar });
-                    }
+                    if (name && !creatorNameCache.has(creatorId)) creatorNameCache.set(creatorId, { name, avatar });
 
-                    const hexId = creatorId.split('@')[0];
-                    const isBlocked = isBlockedCreator(creatorId) || blockedchannels.some(c => c.id.toUpperCase() === hexId);
-
-                    // Force the slideObserver to track every single slide so activeSlide can update accurately
+                    const isBlocked = isBlockedCreator(creatorId);
                     slideObserver.observe(slide);
 
                     if (isBlocked) {
                         slide.classList.add('sm-blocked-slide');
-
-                        // Ensure background players inside invisible blocks remain muted/paused
                         const video = slide.querySelector('video');
                         if (video) {
-                            try {
-                                video.pause();
-                                video.muted = true;
-                            } catch (e) {}
+                            try { video.pause(); video.muted = true; } catch {}
                         }
                     } else {
                         slide.classList.remove('sm-blocked-slide');
@@ -1214,15 +1176,68 @@
         });
     }
 
+    function processUpsells() {
+        if (hideUpsells) {
+            document.querySelectorAll('.navbar-nav a[href*="/shop"]').forEach(a => {
+                const li = a.closest('li') || a;
+                hide(li);
+            });
+
+            const standardUpsells = document.querySelectorAll(
+                'a[href*="discord.gg"], a[href*="discord.com"], ' +
+                'a[href*="patreon.com"], ' +
+                'a[href*="/shop"], a[href*="shop.sudomemo.net"], ' +
+                'a[href*="plush"], img[src*="plush"], img[alt*="plush" i], ' +
+                'a[data-banner-name*="discord_slim"], a[data-banner-name*="patreon_slim"], ' +
+                'a[data-banner-name*="ziggy_patreon"], a[data-banner-name*="shorts_theatre"], ' +
+                'a[data-banner-name*="sudomemo_org_slim"], a[data-banner-name*="plush"], ' +
+                'a[data-banner-name*="merch"]'
+            );
+
+            standardUpsells.forEach(el => {
+                const adBox = el.closest('.advert, .theme-advert-card, [class*="advert"]');
+                if (adBox) {
+                    hide(adBox);
+                    const col = adBox.closest('.col, [class*="col-"]');
+                    if (col && !col.querySelector('.card:not(.theme-advert-card), #genealogy-nodes, .trending-user, .news-item, h1, h2, h3, h4, h5')) {
+                        hide(col);
+                    }
+                } else {
+                    const container = el.closest('li, .btn, .nav-item') || el;
+                    hide(container);
+                }
+            });
+        }
+
+        if (hideGoodUpsells) {
+            const goodUpsells = document.querySelectorAll(
+                'a[data-banner-name*="flipnote_organizer_promo"], ' +
+                'a[data-banner-name*="organizer_slim"], ' +
+                'a[data-banner-name*="archive_slim"], ' +
+                'a[data-banner-name*="sudomemo_wii_room"], ' +
+                'a[data-banner-name*="3ds_install_guide"], ' +
+                'a[data-banner-name*="staying_safe_online"], ' +
+                '#left-sidebar .card.theme-advert-card'
+            );
+
+            goodUpsells.forEach(el => {
+                const adBox = el.closest('.advert, .theme-advert-card, .card') || el;
+                hide(adBox);
+            });
+        }
+    }
+
     function processAll() {
+        detectCurrentUser();
         harvestCreatorNames();
-        // Target outer search-result cards to avoid broken panel outline structures on the search pages
+        processUpsells();
         document.querySelectorAll('.flipnote-item, .flipnote-list-item, .channel-card, .cat-box, .playlist-flipnote, .trending-user, .recommended-item, li:has(.rec-thumbnail), .watch-next-item, .search-samples__item, .search-result').forEach(processItem);
-        processSpotlight(); // Run unconditionally so spotlight is evaluated even when flipstreams are hidden
+        processSpotlight();
         processEmbeds();
         processRelatedFlipnotes();
-        processCategoryThumbs();
+        processChannelPreviews(true);
         processGenealogy();
+        processEmptyCards();
         if (!hideFlipstreams) {
             processFlipstreams();
             processFlipstreamSlides();
@@ -1231,12 +1246,11 @@
 
     function blockChannel(id, name = null) {
         if (!id || blockedchannels.some(c => c.id.toUpperCase() === id.toUpperCase())) return;
-        blockedchannels.push({id, name});
+        blockedchannels.push({ id: id.trim(), name: name || id });
         saveblockedchannels();
         channelmap.get(id)?.forEach(hide);
     }
 
-    // Unblocks targeted IDs
     function unblockChannel(id) {
         blockedchannels = blockedchannels.filter(c => c.id.toUpperCase() !== id.toUpperCase());
         saveblockedchannels();
@@ -1244,64 +1258,66 @@
     }
 
     function blockCreator(id, name = null) {
-        const upperId = id.toUpperCase();
-        if (!id || isWhitelisted(upperId) || blockedcreators.some(c => c.id.toUpperCase() === upperId)) return;
-        const cached = creatorNameCache.get(upperId);
+        const cleanId = cleanCreatorId(id);
+        if (!cleanId || isSelf(cleanId) || isWhitelisted(cleanId) || blockedcreators.some(c => cleanCreatorId(c.id) === cleanId)) return;
+        const cached = creatorNameCache.get(cleanId);
         const avatar = cached?.avatar || '';
-        blockedcreators.push({id, name: name || 'Unknown', avatar});
+        blockedcreators.push({ id: cleanId, name: name || 'Unknown', avatar });
         saveblockedcreators();
-        creatormap.get(id)?.forEach(hide);
+        creatormap.get(cleanId)?.forEach(hide);
         processGenealogy(true);
         processRelatedFlipnotes();
-        processCategoryThumbs(true);
+        processChannelPreviews(true);
+        processEmptyCards();
     }
 
-    // Unblocks targeted IDs
     function unblockCreator(id) {
-        blockedcreators = blockedcreators.filter(c => c.id.toUpperCase() !== id.toUpperCase());
+        const cleanId = cleanCreatorId(id);
+        blockedcreators = blockedcreators.filter(c => cleanCreatorId(c.id) !== cleanId);
         saveblockedcreators();
-        creatormap.get(id)?.forEach(show);
+        creatormap.get(cleanId)?.forEach(show);
         processGenealogy(true);
         processRelatedFlipnotes();
-        processCategoryThumbs(true);
+        processChannelPreviews(true);
+        processEmptyCards();
     }
 
-    // Persistently whitelists specific IDs
     function whitelistCreator(id, name = null) {
-        const upperId = id.toUpperCase();
-        if (!id || whitelistedcreators.some(c => c.id.toUpperCase() === upperId)) return;
-        const cached = creatorNameCache.get(upperId);
+        const cleanId = cleanCreatorId(id);
+        if (!cleanId || whitelistedcreators.some(c => cleanCreatorId(c.id) === cleanId)) return;
+        const cached = creatorNameCache.get(cleanId);
         const avatar = cached?.avatar || '';
-        whitelistedcreators.push({id, name: name || 'Unknown', avatar});
+        whitelistedcreators.push({ id: cleanId, name: name || 'Unknown', avatar });
         savewhitelistedcreators();
-        unblockCreator(id);
-        creatormap.get(id)?.forEach(show);
+        unblockCreator(cleanId);
+        creatormap.get(cleanId)?.forEach(show);
         processGenealogy(true);
         processRelatedFlipnotes();
-        processCategoryThumbs(true);
+        processChannelPreviews(true);
+        processEmptyCards();
     }
 
     function unwhitelistCreator(id) {
-        whitelistedcreators = whitelistedcreators.filter(c => c.id.toUpperCase() !== id.toUpperCase());
+        const cleanId = cleanCreatorId(id);
+        whitelistedcreators = whitelistedcreators.filter(c => cleanCreatorId(c.id) !== cleanId);
         savewhitelistedcreators();
         processGenealogy(true);
         processRelatedFlipnotes();
-        processCategoryThumbs(true);
+        processChannelPreviews(true);
+        processEmptyCards();
     }
 
-    // Identifies target sidebar profile fields
     function getCreatorIdFromSidebar() {
         const link = document.querySelector('#left-sidebar .details-profile-container .profile-right .name a.theme-link.flipnote-title-link');
-        return link?.href.match(/\/user\/([A-F0-9]{16}@DSi)/i)?.[1]?.toUpperCase() ?? null;
+        const match = link?.href.match(/\/user\/([A-F0-9]{16}@DSi)/i);
+        return match ? cleanCreatorId(match[1]) : null;
     }
 
     function shouldRedirect() {
         const p = location.pathname;
 
-        // Blocked flipstream page redirect
-        if (hideFlipstreams && p.startsWith('/flipstream')) {
-            return true;
-        }
+        if (hideFlipstreams && p.startsWith('/flipstream')) return true;
+        if (isWeeklyTopicCategoryPage()) return false;
 
         if (p.startsWith('/channel/')) {
             const chId = p.split('/')[2];
@@ -1311,12 +1327,12 @@
         if (p.startsWith('/watch/')) {
             const channelLink = document.querySelector('a[href^="/channel/"]');
             if (channelLink) {
-                const chId = channelLink.href.match(/\/channel\/([a-zA-Z0-9]+)/)?.[1];
+                const chId = channelLink.href.match(/\/channel\/([a-zA-Z0-9_-]+)/)?.[1];
                 if (chId && blockedchannels.some(c => c.id.toUpperCase() === chId.toUpperCase())) {
                     const flipnoteEl = document.querySelector('.flipnote-title-link[href^="/user/"], .username a[href^="/user/"]');
                     if (flipnoteEl) {
-                        const creatorId = flipnoteEl.href.match(/\/user\/([A-F0-9]{16}@DSi)/i)?.[1]?.toUpperCase();
-                        if (creatorId && isWhitelisted(creatorId)) return false;
+                        const creatorId = cleanCreatorId(flipnoteEl.href.match(/\/user\/([A-F0-9]{16}@DSi)/i)?.[1]);
+                        if (creatorId && (isWhitelisted(creatorId) || isSelf(creatorId))) return false;
                     }
                     return true;
                 }
@@ -1324,16 +1340,16 @@
 
             const flipnoteEl = document.querySelector('.flipnote-title-link[href^="/user/"], .username a[href^="/user/"]');
             if (flipnoteEl) {
-                const creatorId = flipnoteEl.href.match(/\/user\/([A-F0-9]{16}@DSi)/i)?.[1]?.toUpperCase();
-                if (creatorId && !isWhitelisted(creatorId) && blockedcreators.some(c => c.id.toUpperCase() === creatorId.toUpperCase())) return true;
+                const creatorId = cleanCreatorId(flipnoteEl.href.match(/\/user\/([A-F0-9]{16}@DSi)/i)?.[1]);
+                if (creatorId && !isSelf(creatorId) && !isWhitelisted(creatorId) && blockedcreators.some(c => cleanCreatorId(c.id) === creatorId)) return true;
             }
         }
 
         if (p.startsWith('/user/')) {
-            let id = p.split('/')[2]?.toUpperCase();
-            if (!id) return false;
-            if (!id.includes('@DSi')) id = getCreatorIdFromSidebar() || id;
-            if (id && !isWhitelisted(id) && blockedcreators.some(c => c.id.toUpperCase() === id.toUpperCase())) return true;
+            let id = cleanCreatorId(p.split('/')[2]);
+            if (!id) id = getCreatorIdFromSidebar();
+            if (id && isSelf(id)) return false;
+            if (id && !isWhitelisted(id) && blockedcreators.some(c => cleanCreatorId(c.id) === id)) return true;
         }
 
         return false;
@@ -1346,14 +1362,16 @@
     }
 
     function addBlockBtn(el, type, id, name, status) {
-        if (type === 'creator' && status.whitelisted) return;
+        if (type === 'channel' && isWeeklyTopicCategoryPage()) return;
+        if (type === 'creator' && (status.whitelisted || isSelf(id))) return;
         if (el.querySelector(`.sm-btn-${type}`)) return;
+
         const btn = document.createElement('button');
         btn.className = `sm-btn-${type} btn btn-sm ${status.blocked ? 'btn-danger' : status.whitelisted ? 'btn-success' : 'btn-outline-danger'}`;
         btn.title = type === 'channel'
             ? (status.blocked ? 'Show channel' : 'Hide channel')
             : (status.whitelisted ? 'Remove whitelist' : 'Hide this creator');
-        // Use icon for both so the circular overlay button stays compact on thumbs
+
         btn.innerHTML = type === 'channel'
             ? (status.blocked ? '<i class="fas fa-eye"></i>' : '<i class="fas fa-eye-slash"></i>')
             : status.whitelisted ? '<i class="fas fa-star"></i>' : '<i class="fas fa-ban"></i>';
@@ -1376,79 +1394,55 @@
                     btn.innerHTML = '<i class="fas fa-eye"></i>';
                 }
             } else {
-                const upperId = id.toUpperCase();
-                const cached = creatorNameCache.get(upperId);
+                const cleanId = cleanCreatorId(id);
+                const cached = creatorNameCache.get(cleanId);
                 const finalName = cached?.name || name || 'Unknown';
 
-                const isWhite = whitelistedcreators.some(c => c.id.toUpperCase() === upperId);
-                const isBlocked = blockedcreators.some(c => c.id.toUpperCase() === upperId);
+                const isWhite = whitelistedcreators.some(c => cleanCreatorId(c.id) === cleanId);
+                const isBlocked = blockedcreators.some(c => cleanCreatorId(c.id) === cleanId);
                 if (isWhite) {
-                    unwhitelistCreator(id);
+                    unwhitelistCreator(cleanId);
                 } else if (isBlocked) {
-                    unblockCreator(id);
+                    unblockCreator(cleanId);
                 } else {
-                    blockCreator(id, finalName);
+                    blockCreator(cleanId, finalName);
                 }
-                const nowWhite = whitelistedcreators.some(c => c.id.toUpperCase() === upperId);
-                updateCreatorBtn(btn, blockedcreators.some(c => c.id.toUpperCase() === upperId), nowWhite);
+                const nowWhite = whitelistedcreators.some(c => cleanCreatorId(c.id) === cleanId);
+                updateCreatorBtn(btn, blockedcreators.some(c => cleanCreatorId(c.id) === cleanId), nowWhite);
             }
         };
 
         if (type === 'creator') {
+            let pressTimer = null;
             const toggleWhitelist = () => {
-                const upperId = id.toUpperCase();
-                const cached = creatorNameCache.get(upperId);
+                const cleanId = cleanCreatorId(id);
+                const cached = creatorNameCache.get(cleanId);
                 const finalName = cached?.name || name || 'Unknown';
-                const isWhite = whitelistedcreators.some(c => c.id.toUpperCase() === upperId);
-                if (isWhite) unwhitelistCreator(id);
-                else whitelistCreator(id, finalName);
-                updateCreatorBtn(btn, blockedcreators.some(c => c.id.toUpperCase() === upperId), !isWhite);
+                const isWhite = whitelistedcreators.some(c => cleanCreatorId(c.id) === cleanId);
+                if (isWhite) unwhitelistCreator(cleanId);
+                else whitelistCreator(cleanId, finalName);
+                updateCreatorBtn(btn, blockedcreators.some(c => cleanCreatorId(c.id) === cleanId), !isWhite);
             };
-            const startLongPress = () => { longpresstimer = setTimeout(toggleWhitelist, 600); };
-            const cancel = () => clearTimeout(longpresstimer);
             btn.addEventListener('mousedown', e => { if (e.button === 2) { e.preventDefault(); toggleWhitelist(); } });
-            btn.addEventListener('touchstart', startLongPress);
-            btn.addEventListener('touchend', cancel);
-            btn.addEventListener('touchcancel', cancel);
-            btn.addEventListener('touchmove', cancel);
+            btn.addEventListener('touchstart', () => { pressTimer = setTimeout(toggleWhitelist, 600); });
+            btn.addEventListener('touchend', () => clearTimeout(pressTimer));
+            btn.addEventListener('touchcancel', () => clearTimeout(pressTimer));
+            btn.addEventListener('touchmove', () => clearTimeout(pressTimer));
             btn.addEventListener('contextmenu', e => e.preventDefault());
         }
 
-        // Resolves the exact element to overlay the button over (supporting watch-next, playlist, search, related, genealogy, category channels)
-        // Prefer category grid path: .category-thumbs .thumb a > img.flipnote-hoverpreview-img
-        const catThumbImg = el.querySelector('.category-thumbs .thumb a img.flipnote-hoverpreview-img') ||
-                            el.querySelector('.category-thumbs img.flipnote-hoverpreview-img');
+        const catThumbImg = el.querySelector('.category-thumbs .thumb a img.flipnote-hoverpreview-img, .category-thumbs img.flipnote-hoverpreview-img');
         const thumbContainer = (catThumbImg && (catThumbImg.closest('a') || catThumbImg.parentElement)) ||
-                               el.querySelector('div.flipnote-item-thumb') ||
-                               el.querySelector('.flipstream-thumbnail-card__frame') ||
-                               el.querySelector('.related-preview a') ||
-                               el.querySelector('.related-preview') ||
-                               el.querySelector('.category-thumbs .thumb a') ||
-                               el.querySelector('.category-thumbs .thumb') ||
-                               el.querySelector('.category-thumbs a') ||
-                               el.querySelector('.flipnote-genealogy-card') ||
-                               el.querySelector('.playlist-flipnote-thumb')?.parentElement ||
-                               el.querySelector('.rec-thumbnail')?.parentElement ||
-                               el.querySelector('.search-samples__thumb')?.parentElement ||
-                               el.querySelector('.search-movie__thumb')?.parentElement ||
-                               el.querySelector('.playlist-flipnote-thumb') ||
-                               el.querySelector('.rec-thumbnail') ||
-                               el.querySelector('.search-samples__thumb') ||
-                               el.querySelector('.search-movie__thumb-link') ||
-                               el.querySelector('.recommended-thumb-link, .recommended-thumb')?.closest('a') ||
-                               el.querySelector('a[href^="/user/"] img')?.parentElement ||
+                               el.querySelector('div.flipnote-item-thumb, .flipstream-thumbnail-card__frame, .related-preview a, .related-preview, .flipnote-genealogy-card') ||
+                               el.querySelector('.playlist-flipnote-thumb, .rec-thumbnail, .search-samples__thumb, .search-movie__thumb-link')?.closest('a, div') ||
                                el.querySelector('img')?.parentElement;
 
         if (thumbContainer) {
             thumbContainer.style.position = 'relative';
-            thumbContainer.style.display = thumbContainer.style.display || '';
-            // Ensure the anchor can host an absolute child
-            if (thumbContainer.tagName === 'A') {
-                thumbContainer.style.display = 'inline-block';
-            }
+            if (thumbContainer.tagName === 'A') thumbContainer.style.display = 'inline-block';
             thumbContainer.appendChild(btn);
         } else {
-            const target = el.querySelector('.flipnote-stats, .stats, .username, .meta, .flipnote-item-info, .playlist-flipnote-info, .recommended-item-info') || el.lastElementChild;
+            const target = el.querySelector('.flipnote-stats, .stats, .username, .meta, .flipnote-item-info') || el.lastElementChild;
             if (target) target.appendChild(btn);
         }
 
@@ -1456,33 +1450,38 @@
     }
 
     function renderList(list, type, iconFn = null) {
-        if (list.length === 0) return `<div class="text-muted py-5 text-center"><i class="fas fa-inbox fa-3x mb-3"></i><br>Empty.</div>`;
+        if (!list || list.length === 0) return `<div class="text-muted py-5 text-center"><i class="fas fa-inbox fa-3x mb-3"></i><br>Empty.</div>`;
         let html = `<div class="list-group list-group-flush">`;
+
         list.forEach(item => {
-            const display = item.name || item.id;
+            const safeName = escapeHTML(item.name || item.id);
+            const safeId = escapeHTML(item.id);
 
             let iconHtml = '';
             if (type === 'channel' && iconFn) {
-                iconHtml = `<img src="${iconFn(item.id)}" width="40" height="40" class="me-3 rounded" onerror="this.style.display='none'">`;
+                const safeUrl = escapeHTML(iconFn(item.id));
+                iconHtml = `<img src="${safeUrl}" width="40" height="40" class="me-3 rounded" onerror="this.style.display='none'">`;
             } else if (type === 'creator') {
-                const cached = creatorNameCache.get(item.id.toUpperCase());
-                const avatarUrl = item.avatar || cached?.avatar || '';
+                const cleanId = cleanCreatorId(item.id);
+                const cached = creatorNameCache.get(cleanId);
+                const rawAvatar = item.avatar || cached?.avatar || '';
 
-                if (avatarUrl) {
-                    iconHtml = `<img src="${avatarUrl}" width="40" height="40" class="me-3 rounded" onerror="this.style.display='none'">`;
+                if (rawAvatar && (rawAvatar.startsWith('https://') || rawAvatar.startsWith('/'))) {
+                    const safeAvatar = escapeHTML(rawAvatar);
+                    iconHtml = `<img src="${safeAvatar}" width="40" height="40" class="me-3 rounded sm-avatar-img" data-id="${safeId}" onerror="this.style.display='none'">`;
                 } else {
-                    iconHtml = `<div class="me-3 sm-avatar-placeholder" data-id="${item.id}"><i class="fas fa-user text-muted"></i></div>`;
+                    iconHtml = `<div class="me-3 sm-avatar-placeholder" data-id="${safeId}"><i class="fas fa-user text-muted"></i></div>`;
                 }
             }
 
             html += `
-                <div class="list-group-item bg-dark border-secondary d-flex align-items-center py-3" data-id="${item.id}">
+                <div class="list-group-item bg-dark border-secondary d-flex align-items-center py-3" data-id="${safeId}">
                     ${iconHtml}
                     <div class="flex-grow-1">
-                        <div class="fw-bold">${display}</div>
-                        <small class="text-muted">${item.id}</small>
+                        <div class="fw-bold">${safeName}</div>
+                        <small class="text-muted">${safeId}</small>
                     </div>
-                    <button class="btn btn-sm btn-outline-danger sm-unblock" data-id="${item.id}">Remove</button>
+                    <button class="btn btn-sm btn-outline-danger sm-unblock" data-id="${safeId}">Remove</button>
                 </div>`;
         });
         html += `</div>`;
@@ -1492,13 +1491,14 @@
     function openBlocklistModal() {
         const existing = document.getElementById('sm-blocklist-modal');
         if (existing) existing.remove();
+
         const backdrop = document.createElement('div');
         backdrop.id = 'sm-blocklist-modal';
-        Object.assign(backdrop.style, {position:'fixed', inset:'0', background:'rgba(0,0,0,0.75)', zIndex:9999, display:'flex', justifyContent:'center', alignItems:'center'});
+        Object.assign(backdrop.style, { position: 'fixed', inset: '0', background: 'rgba(0,0,0,0.75)', zIndex: 9999, display: 'flex', justifyContent: 'center', alignItems: 'center' });
+
         const dialog = document.createElement('div');
         dialog.className = 'sm-dialog';
         dialog.innerHTML = `
-            <!-- Tab Layout -->
             <div class="row g-2 mb-4">
                 <div class="col-4">
                     <button id="sm-show-channels" class="btn btn-outline-primary w-100 py-3 d-flex flex-column align-items-center gap-2">
@@ -1520,7 +1520,6 @@
                 </div>
             </div>
 
-            <!-- Manual Add Field -->
             <div class="input-group mb-2">
                 <select id="sm-add-type" class="form-select bg-dark text-light border-secondary" style="max-width: 110px;">
                     <option value="channel">Channel</option>
@@ -1531,7 +1530,6 @@
             </div>
             <p id="sm-add-hint" class="text-muted small px-1 mb-4">Channel ID from /channel/...</p>
 
-            <!-- Preference Panel Card -->
             <div class="card bg-dark border-secondary p-3 mb-4">
                 <h6 class="text-uppercase small tracking-wider text-muted mb-3 fw-bold">Preferences</h6>
 
@@ -1539,9 +1537,9 @@
                     <input class="form-check-input" type="checkbox" id="sm-toggle-hide-upsells" ${hideUpsells ? 'checked' : ''}>
                     <label class="form-check-label d-inline-flex align-items-center" for="sm-toggle-hide-upsells">
                         Hide Upsells
-                        <span class="sm-help-badge" title="Hides Discord, Patreon, Shop/Merchandise, and YouTube Shorts promotions.">?</span>
+                        <span class="sm-help-badge" title="Hides Discord, Patreon, Shop/Merchandise, Plush ads, and YouTube Shorts promotions.">?</span>
                     </label>
-                    <div class="text-muted small ps-1 mt-1">Discord, Patreon, Merch, Shorts promo</div>
+                    <div class="text-muted small ps-1 mt-1">Discord, Patreon, Merch, Plush, Shorts promo</div>
                 </div>
 
                 <div class="form-check form-switch mb-3">
@@ -1565,7 +1563,6 @@
 
             <hr class="my-3 border-secondary">
 
-            <!-- Side-by-side Import/Export Actions -->
             <div class="row g-2 mt-2">
                 <div class="col-6">
                     <button id="sm-import-btn" class="btn btn-outline-secondary btn-sm w-100 py-2"><i class="fas fa-file-import me-1"></i> Import</button>
@@ -1575,52 +1572,61 @@
                 </div>
             </div>
         `;
+
         backdrop.appendChild(dialog);
         document.body.appendChild(backdrop);
+
         backdrop.onclick = e => { if (e.target === backdrop) backdrop.remove(); };
         document.getElementById('sm-show-channels').onclick = () => { backdrop.remove(); openListWindow('channel'); };
         document.getElementById('sm-show-blocked').onclick = () => { backdrop.remove(); openListWindow('blocked'); };
         document.getElementById('sm-show-whitelist').onclick = () => { backdrop.remove(); openListWindow('whitelist'); };
+
         document.getElementById('sm-export-all').onclick = () => {
             const data = { blockedchannels, blockedcreators, whitelistedcreators };
-            const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
+            const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
-            a.href = url; a.download = 'sudomemo_blocklist.json'; a.click();
+            a.href = url;
+            a.download = 'sudomemo_blocklist.json';
+            a.click();
             URL.revokeObjectURL(url);
         };
 
-        // Listeners for switches
-        document.getElementById('sm-toggle-hide-upsells').onchange = (e) => {
-            GM_setValue('hideupsells', e.target.checked);
+        document.getElementById('sm-toggle-hide-upsells').onchange = e => {
+            hideUpsells = e.target.checked;
+            GM_setValue('hideupsells', hideUpsells);
+            processUpsells();
         };
-        document.getElementById('sm-toggle-hide-good-upsells').onchange = (e) => {
-            GM_setValue('hidegoodupsells', e.target.checked);
+
+        document.getElementById('sm-toggle-hide-good-upsells').onchange = e => {
+            hideGoodUpsells = e.target.checked;
+            GM_setValue('hidegoodupsells', hideGoodUpsells);
+            processUpsells();
         };
-        document.getElementById('sm-toggle-hide-flipstreams').onchange = (e) => {
-            GM_setValue('hideflipstreams', e.target.checked);
+
+        document.getElementById('sm-toggle-hide-flipstreams').onchange = e => {
+            hideFlipstreams = e.target.checked;
+            GM_setValue('hideflipstreams', hideFlipstreams);
         };
 
         const addType = document.getElementById('sm-add-type');
         const addInput = document.getElementById('sm-add-id');
+
         addType.addEventListener('change', () => {
             addInput.placeholder = addType.value === 'channel' ? 'Channel ID' : 'Creator ID (XXXX@DSi)';
-        });
-        function updateHint() {
             document.getElementById('sm-add-hint').textContent = addType.value === 'channel'
                 ? 'Channel ID from /channel/1234ABCD'
                 : 'Creator IDs end with "@DSi"';
-        }
-        addType.addEventListener('change', updateHint);
-        updateHint();
+        });
+
         document.getElementById('sm-add-btn').onclick = () => {
             let id = addInput.value.trim();
             if (!id) return;
-            const type = addType.value;
-            if (type === 'creator') id = id.toUpperCase();
-            type === 'channel' ? blockChannel(id) : blockCreator(id);
+            if (addType.value === 'channel') blockChannel(id);
+            else blockCreator(cleanCreatorId(id));
             addInput.value = '';
         };
+
         document.getElementById('sm-import-btn').onclick = () => {
             const input = document.createElement('input');
             input.type = 'file';
@@ -1631,17 +1637,21 @@
                 const reader = new FileReader();
                 reader.onload = ev => {
                     try {
-                        const data = JSON.parse(ev.target.result);
-                        blockedchannels = data.blockedchannels || [];
-                        blockedcreators = data.blockedcreators || [];
-                        whitelistedcreators = data.whitelistedcreators || [];
+                        const parsed = JSON.parse(ev.target.result);
+                        if (typeof parsed !== 'object' || parsed === null) throw new Error();
+
+                        blockedchannels = sanitizeList(parsed.blockedchannels, false);
+                        blockedcreators = sanitizeList(parsed.blockedcreators, true);
+                        whitelistedcreators = sanitizeList(parsed.whitelistedcreators, true);
+
                         saveblockedchannels();
                         saveblockedcreators();
                         savewhitelistedcreators();
-                        alert('Imported successfully');
+
+                        alert('Imported successfully.');
                         backdrop.remove();
                     } catch {
-                        alert('Invalid file format');
+                        alert('Invalid or corrupted blocklist JSON file.');
                     }
                 };
                 reader.readAsText(file);
@@ -1657,10 +1667,12 @@
         const title = isChannel ? 'Hidden Channels' : isWhitelist ? 'Whitelisted Creators' : 'Hidden Creators';
         const iconColor = isChannel ? '#4dabf7' : isWhitelist ? '#28a745' : '#ff6b6b';
         const icon = isChannel ? 'tv' : (isWhitelist ? 'star' : 'user');
+
         const backdrop = document.createElement('div');
-        backdrop.style.cssText = `position:fixed; inset:0; background:rgba(0,0,0,0.8); z-index:10000; display:flex; justify-content:center; align-items:center;`;
+        backdrop.style.cssText = 'position:fixed; inset:0; background:rgba(0,0,0,0.8); z-index:10000; display:flex; justify-content:center; align-items:center;';
+
         const dialog = document.createElement('div');
-        dialog.style.cssText = `background:#121212; color:#e0e0e0; border:1px solid #333; border-radius:12px; width:620px; max-width:94%; max-height:90vh; overflow:hidden; display:flex; flex-direction:column;`;
+        dialog.style.cssText = 'background:#121212; color:#e0e0e0; border:1px solid #333; border-radius:12px; width:620px; max-width:94%; max-height:90vh; overflow:hidden; display:flex; flex-direction:column;';
         dialog.innerHTML = `
             <div class="p-4 pb-2 d-flex justify-content-between align-items-center">
                 <button class="btn btn-sm btn-outline-secondary back-btn"><i class="fas fa-arrow-left me-2"></i>Back</button>
@@ -1668,41 +1680,67 @@
                     <h5><i class="fas fa-${icon}" style="color:${iconColor}"></i> ${title}</h5>
                     <small>${list.length} item${list.length !== 1 ? 's' : ''}</small>
                 </div>
-                <button class="btn btn-sm close" style="background:rgba(255,255,255,0.05);color:#ccc;">×</button>
+                <button class="btn btn-sm close" style="background:rgba(255,255,255,0.05);color:#ccc;">x</button>
             </div>
             <div class="px-4 pb-4" style="overflow-y:auto; flex-grow:1;">
-                ${renderList(list, isChannel ? 'channel' : 'creator', isChannel ? id => `https://www.sudomemo.net/theatre_assets/images/dynamic/channel/${id}.png` : null)}
+                ${renderList(list, isChannel ? 'channel' : 'creator', isChannel ? id => `https://www.sudomemo.net/theatre_assets/images/dynamic/channel/${encodeURIComponent(id)}.png` : null)}
             </div>
         `;
+
         backdrop.appendChild(dialog);
         document.body.appendChild(backdrop);
+
         dialog.querySelector('.close').onclick = () => backdrop.remove();
         backdrop.onclick = e => { if (e.target === backdrop) backdrop.remove(); };
         dialog.querySelector('.back-btn').onclick = () => { backdrop.remove(); openBlocklistModal(); };
 
         if (mode === 'blocked' || mode === 'whitelist') {
-            list.forEach(item => {
-                resolveCreatorName(item.id, (resolvedName, resolvedAvatar) => {
-                    dialog.querySelectorAll(`.sm-avatar-placeholder[data-id="${item.id}"]`).forEach(placeholder => {
-                        if (resolvedAvatar) {
-                            const img = document.createElement('img');
-                            img.src = resolvedAvatar;
-                            img.width = 40;
-                            img.height = 40;
-                            img.className = 'me-3 rounded';
-                            img.onerror = () => { img.style.display = 'none'; };
-                            placeholder.replaceWith(img);
+            const queue = [...list];
+            let activeRequests = 0;
+            const maxConcurrency = 2;
+
+            function runQueue() {
+                while (activeRequests < maxConcurrency && queue.length > 0) {
+                    const item = queue.shift();
+                    activeRequests++;
+
+                    resolveCreatorName(item.id, (resolvedName, resolvedAvatar) => {
+                        const safeId = escapeHTML(item.id);
+
+                        dialog.querySelectorAll(`.sm-avatar-placeholder[data-id="${safeId}"]`).forEach(placeholder => {
+                            if (resolvedAvatar) {
+                                const img = document.createElement('img');
+                                img.src = resolvedAvatar;
+                                img.width = 40;
+                                img.height = 40;
+                                img.className = 'me-3 rounded sm-avatar-img';
+                                img.dataset.id = item.id;
+                                img.onerror = () => { img.style.display = 'none'; };
+                                placeholder.replaceWith(img);
+                            }
+                        });
+
+                        dialog.querySelectorAll(`img.sm-avatar-img[data-id="${safeId}"]`).forEach(img => {
+                            if (resolvedAvatar && img.src !== resolvedAvatar) {
+                                img.src = resolvedAvatar;
+                                img.style.display = '';
+                            }
+                        });
+
+                        const row = dialog.querySelector(`.list-group-item[data-id="${safeId}"]`);
+                        if (row) {
+                            const nameEl = row.querySelector('.fw-bold');
+                            if (nameEl && resolvedName && nameEl.textContent !== resolvedName) {
+                                nameEl.textContent = resolvedName;
+                            }
                         }
+                    }, true).finally(() => {
+                        activeRequests--;
+                        setTimeout(runQueue, 150);
                     });
-                    const row = dialog.querySelector(`.list-group-item[data-id="${item.id}"]`);
-                    if (row) {
-                        const nameEl = row.querySelector('.fw-bold');
-                        if (nameEl && (nameEl.textContent === 'Unknown' || nameEl.textContent === item.id)) {
-                            nameEl.textContent = resolvedName;
-                        }
-                    }
-                });
-            });
+                }
+            }
+            runQueue();
         }
 
         dialog.querySelectorAll('.sm-unblock').forEach(btn => {
@@ -1720,18 +1758,14 @@
                     row.style.border = 'none';
                     setTimeout(() => {
                         row.remove();
-
                         const countEl = dialog.querySelector('.p-4.pb-2 small');
                         if (countEl) {
                             const currentCount = parseInt(countEl.textContent) || 0;
                             const newCount = Math.max(0, currentCount - 1);
                             countEl.textContent = `${newCount} item${newCount !== 1 ? 's' : ''}`;
-
                             if (newCount === 0) {
-                                const listContainer = dialog.querySelector('.px-4.pb-4');
-                                if (listContainer) {
-                                    listContainer.innerHTML = `<div class="text-muted py-5 text-center"><i class="fas fa-inbox fa-3x mb-3"></i><br>Empty.</div>`;
-                                }
+                                const container = dialog.querySelector('.px-4.pb-4');
+                                if (container) container.innerHTML = '<div class="text-muted py-5 text-center"><i class="fas fa-inbox fa-3x mb-3"></i><br>Empty.</div>';
                             }
                         }
                     }, 250);
@@ -1759,29 +1793,30 @@
 
     function init() {
         loadSets();
-
-        // Target specifically the top navbar/menus to accurately identify logged-in user profile IDs
-        const navLink = document.querySelector('.navbar-nav a[href^="/user/"], nav a[href^="/user/"], .dropdown-menu a[href^="/user/"], #user-dropdown a[href^="/user/"], .user-menu a[href^="/user/"]');
-        const own = navLink?.href.match(/\/user\/([A-F0-9]{16}@DSi)/i)?.[1]?.toUpperCase();
-        if (own) currentuser = own;
-
+        detectCurrentUser();
         processAll();
         injectMenuButton();
         setInterval(injectMenuButton, 2000);
 
         new MutationObserver(muts => {
-            if (shouldRedirect()) {
-                safeRedirect();
-                return;
-            }
-            processSpotlight(); // Run unconditionally so spotlight is evaluated even when flipstreams are hidden
-            processEmbeds();
-            processRelatedFlipnotes();
-            // Category thumbs + genealogy are throttled in the interval, skip on every mutation
-            if (!hideFlipstreams) {
-                processFlipstreams();
-                processFlipstreamSlides();
-            }
+            if (mutationDebounceTimer) return;
+            mutationDebounceTimer = setTimeout(() => {
+                mutationDebounceTimer = null;
+                if (shouldRedirect()) {
+                    safeRedirect();
+                    return;
+                }
+                processUpsells();
+                processSpotlight();
+                processEmbeds();
+                processRelatedFlipnotes();
+                processEmptyCards();
+                if (!hideFlipstreams) {
+                    processFlipstreams();
+                    processFlipstreamSlides();
+                }
+            }, 250);
+
             muts.forEach(m => {
                 if (m.addedNodes.length) m.addedNodes.forEach(n => {
                     if (n.nodeType !== 1) return;
@@ -1789,161 +1824,189 @@
                     else n.querySelectorAll('.flipnote-item, .flipnote-list-item, .channel-card, .cat-box, .playlist-flipnote, .trending-user, .recommended-item, li:has(.rec-thumbnail), .watch-next-item, .search-samples__item, .search-result').forEach(processItem);
                 });
             });
-        }).observe(document.body, {childList:true, subtree:true});
+        }).observe(document.body, { childList: true, subtree: true });
 
         setInterval(() => {
+            detectCurrentUser();
             harvestCreatorNames();
+            processUpsells();
 
-            // Trending creators are explicitly omitted from receiving block buttons, but stay hidden if blocked
+            const onWeeklyTopics = isWeeklyTopicCategoryPage();
+
             document.querySelectorAll('.flipnote-item:not(.sm-btn-added), .flipnote-list-item:not(.sm-btn-added), .channel-card:not(.sm-btn-added), .cat-box:not(.sm-btn-added), .playlist-flipnote:not(.sm-btn-added), .recommended-item:not(.sm-btn-added), li:has(.rec-thumbnail):not(.sm-btn-added), .watch-next-item:not(.sm-btn-added), .search-samples__item:not(.sm-btn-added), .search-result:not(.sm-btn-added)')
                 .forEach(el => {
-                    // Category grid cards: per-thumb buttons are handled by processCategoryThumbs, skip card-level buttons
+                    const isChannelCard = el.matches('.channel-card, .cat-box, .channel-grid-item') || el.classList.contains('channel-card') || el.classList.contains('cat-box');
+
+                    if (isChannelCard) {
+                        if (!onWeeklyTopics && !el.querySelector('.category-thumbs .thumb')) {
+                            const ch = getChannelId(el);
+                            const chName = getChannelName(el);
+                            if (ch) addBlockBtn(el, 'channel', ch, chName, { blocked: blockedchannels.some(c => c.id.toUpperCase() === ch.toUpperCase()) });
+                        }
+                        el.classList.add('sm-btn-added');
+                        return;
+                    }
+
                     if (el.querySelector('.category-thumbs .thumb')) {
                         el.classList.add('sm-btn-added');
                         return;
                     }
 
-                    const ch = getChannelId(el);
                     const cr = getCreatorId(el);
-                    const chName = getChannelName(el);
                     const crName = getCreatorName(el);
-                    if (ch) addBlockBtn(el, 'channel', ch, chName, {blocked: blockedchannels.some(c => c.id.toUpperCase() === ch.toUpperCase())});
                     if (cr) {
                         const isBlocked = isBlockedCreator(cr);
                         const isWhite = isWhitelisted(cr);
-
-                        // Prevent adding a block button to yourself or whitelisted creators, while still marking the node processed
-                        if (!isWhite && cr !== currentuser) {
-                            addBlockBtn(el, 'creator', cr, crName, {blocked: isBlocked, whitelisted: false});
+                        if (!isWhite && !isSelf(cr)) {
+                            addBlockBtn(el, 'creator', cr, crName, { blocked: isBlocked, whitelisted: false });
                         }
                     }
                     el.classList.add('sm-btn-added');
                 });
 
-            processSpotlight(); // Run unconditionally so spotlight is evaluated even when flipstreams are hidden
+            processSpotlight();
             processEmbeds();
             processRelatedFlipnotes();
-            processCategoryThumbs();
+            processChannelPreviews();
             processGenealogy();
+            processEmptyCards();
 
-            // Safeguards to save resource cycles if Flipstreams are configured hidden
             if (!hideFlipstreams) {
                 processFlipstreams();
                 processFlipstreamSlides();
             }
         }, 1200);
 
-        if (shouldRedirect()) {
-            safeRedirect();
-        }
+        if (shouldRedirect()) safeRedirect();
     }
 
+    GM_addStyle(`
+        .sm-btn-creator,
+        .sm-btn-channel {
+            position: absolute !important;
+            top: 8px !important;
+            right: 8px !important;
+            width: 28px !important;
+            height: 28px !important;
+            border-radius: 50% !important;
+            padding: 0 !important;
+            font-size: 0.9rem !important;
+            opacity: 0;
+            transition: opacity 0.2s;
+            z-index: 10;
+            background: rgba(220, 53, 69, 0.9) !important;
+            color: white !important;
+            border: none !important;
+            display: none;
+            align-items: center !important;
+            justify-content: center !important;
+            line-height: 1 !important;
+        }
 
-      GM_addStyle(`
-          .sm-btn-creator,
-          .sm-btn-channel {
-              position: absolute !important;
-              top: 8px !important;
-              right: 8px !important;
-              width: 28px !important;
-              height: 28px !important;
-              border-radius: 50% !important;
-              padding: 0 !important;
-              font-size: 0.9rem !important;
-              opacity: 0;
-              transition: opacity 0.2s;
-              z-index: 10;
-              background: rgba(220, 53, 69, 0.9) !important;
-              color: white !important;
-              border: none !important;
-              display: none;
-              align-items: center !important;
-              justify-content: center !important;
-              line-height: 1 !important;
-          }
+        .flipnote-list-item:hover .sm-btn-creator,
+        .flipstream-list-item:hover .sm-btn-creator,
+        .playlist-flipnote:hover .sm-btn-creator,
+        .recommended-item:hover .sm-btn-creator,
+        li:has(.rec-thumbnail):hover .sm-btn-creator,
+        .watch-next-item:hover .sm-btn-creator,
+        .search-samples__item:hover .sm-btn-creator,
+        .search-result:hover .sm-btn-creator,
+        .related-flipnote-container:hover .sm-btn-creator,
+        .related-preview:hover .sm-btn-creator,
+        .related-preview a:hover .sm-btn-creator,
+        .flipnote-genealogy-card:hover .sm-btn-creator,
+        .channel-card:not(:has(.category-thumbs)):hover .sm-btn-channel,
+        .cat-box:not(:has(.category-thumbs)):hover .sm-btn-channel {
+            opacity: 1;
+            display: flex;
+        }
 
-          .flipnote-list-item:hover .sm-btn-creator,
-          .flipstream-list-item:hover .sm-btn-creator,
-          .playlist-flipnote:hover .sm-btn-creator,
-          .recommended-item:hover .sm-btn-creator,
-          li:has(.rec-thumbnail):hover .sm-btn-creator,
-          .watch-next-item:hover .sm-btn-creator,
-          .search-samples__item:hover .sm-btn-creator,
-          .search-result:hover .sm-btn-creator,
-          .related-flipnote-container:hover .sm-btn-creator,
-          .related-preview:hover .sm-btn-creator,
-          .related-preview a:hover .sm-btn-creator,
-          .flipnote-genealogy-card:hover .sm-btn-creator,
-          /* Non-category channel cards: show channel hide on card hover */
-          .channel-card:not(:has(.category-thumbs)):hover .sm-btn-channel,
-          .cat-box:not(:has(.category-thumbs)):hover .sm-btn-channel {
-              opacity: 1;
-              display: flex;
-          }
+        .category-thumbs .thumb:hover > .sm-btn-creator,
+        .category-thumbs .thumb:hover > a > .sm-btn-creator,
+        .category-thumbs .thumb a:hover > .sm-btn-creator,
+        .channel-thumbs .thumb:hover > .sm-btn-creator,
+        .channel-thumbs .thumb a:hover > .sm-btn-creator,
+        .cat-box .thumb:hover > .sm-btn-creator,
+        .cat-box .thumb a:hover > .sm-btn-creator,
+        .channel-card .thumb:hover > .sm-btn-creator,
+        .channel-card .thumb a:hover > .sm-btn-creator {
+            opacity: 1;
+            display: flex;
+        }
 
-          /* Category grid: only show creator button on the specific thumb being hovered */
-          .category-thumbs .thumb:hover > .sm-btn-creator,
-          .category-thumbs .thumb:hover > a > .sm-btn-creator,
-          .category-thumbs .thumb a:hover > .sm-btn-creator {
-              opacity: 1;
-              display: flex;
-          }
+        .category-thumbs .sm-btn-channel,
+        .category-grid .category-thumbs .sm-btn-channel,
+        .channel-thumbs .sm-btn-channel {
+            display: none !important;
+        }
 
-          /* Channel hide button should never appear inside category thumb strips */
-          .category-thumbs .sm-btn-channel,
-          .category-grid .category-thumbs .sm-btn-channel {
-              display: none !important;
-          }
+        .category-thumbs .thumb,
+        .category-thumbs .thumb a,
+        .category-thumbs .thumb a:has(img.flipnote-hoverpreview-img) {
+            position: relative !important;
+            display: inline-block;
+        }
+        .category-thumbs .thumb a img.flipnote-hoverpreview-img { display: block; }
 
-          .category-thumbs .thumb,
-          .category-thumbs .thumb a,
-          .category-thumbs .thumb a:has(img.flipnote-hoverpreview-img) {
-              position: relative !important;
-              display: inline-block;
-          }
-          .category-thumbs .thumb a img.flipnote-hoverpreview-img {
-              display: block;
-          }
+        .sm-blurred-genealogy .sm-btn-creator {
+            display: none !important;
+            opacity: 0 !important;
+        }
 
-          /* Never show block button on blurred genealogy cards */
-          .sm-blurred-genealogy .sm-btn-creator {
-              display: none !important;
-              opacity: 0 !important;
-          }
+        @media (max-width: 768px) {
+            .sm-btn-creator,
+            .sm-btn-channel {
+                opacity: 1 !important;
+                display: flex !important;
+                width: 36px !important;
+                height: 36px !important;
+                font-size: 1.1rem !important;
+                top: 10px !important;
+                right: 10px !important;
+            }
+            .sm-blurred-genealogy .sm-btn-creator { display: none !important; }
+        }
+    `);
 
-          @media (max-width: 768px) {
-              .sm-btn-creator,
-              .sm-btn-channel {
-                  opacity: 1 !important;
-                  display: flex !important;
-                  width: 36px !important;
-                  height: 36px !important;
-                  font-size: 1.1rem !important;
-                  top: 10px !important;
-                  right: 10px !important;
-              }
-              /* Still hide on blurred genealogy even on mobile */
-              .sm-blurred-genealogy .sm-btn-creator {
-                  display: none !important;
-              }
-          }
-      `);
-
-    // Upsell hiding rules
     if (hideUpsells) {
         GM_addStyle(`
-            .advert.mb-3 a[data-banner-name*="discord_slim"],
-            .advert.mb-3 a[data-banner-name*="sudomemo_org_slim"],
-            .advert.mb-3 a[data-banner-name*="patreon_slim"],
-            .advert.mb-3 a[data-banner-name*="shorts_theatre"],
-            .advert.mb-3 a[data-banner-name*="ziggy_patreon"],
-            a[href*="/shop/#merch"] { display: none !important; }
-            .advert:has(a[data-banner-name*="discord_slim"]),
+            a[href*="discord.gg"],
+            a[href*="discord.com/invite"],
+            .advert:has(a[href*="discord"]),
+            .advert:has(a[data-banner-name*="discord_slim"]) { display: none !important; }
+        `);
+
+        GM_addStyle(`
+            a[href*="patreon.com"],
+            .advert:has(a[href*="patreon"]),
+            .advert:has(a[data-banner-name*="patreon_slim"]),
+            .advert:has(a[data-banner-name*="ziggy_patreon"]) { display: none !important; }
+        `);
+
+        GM_addStyle(`
+            a[href*="/shop"],
+            .navbar-nav a[href*="/shop"],
+            .navbar-nav li:has(a[href*="/shop"]),
+            .advert:has(a[href*="/shop"]),
+            .advert:has(a[data-banner-name*="merch"]) { display: none !important; }
+        `);
+
+        GM_addStyle(`
+            a[href*="plush"],
+            img[src*="plush"],
+            img[alt*="plush" i],
+            .advert:has(img[src*="plush"]),
+            .advert:has(a[href*="plush"]),
+            .advert:has([data-banner-name*="plush"]) { display: none !important; }
+        `);
+
+        GM_addStyle(`
+            .advert:has(a[data-banner-name*="shorts_theatre"]),
             .advert:has(a[data-banner-name*="sudomemo_org_slim"]) { display: none !important; }
         `);
     }
 
-    if (hideGoodUpsells && hideUpsells) {
+    if (hideGoodUpsells) {
         GM_addStyle(`
             .advert a[data-banner-name*="flipnote_organizer_promo"],
             .advert a[data-banner-name*="sudomemo_wii_room"],
@@ -1951,18 +2014,24 @@
             .advert a[data-banner-name*="staying_safe_online"],
             .advert a[data-banner-name*="organizer_slim"],
             .advert a[data-banner-name*="archive_slim"],
-            html body.theme-body.body-fullwidth-mobile div.row.pt-sm-1 div#left-sidebar.col-12.col-lg-3.col-xl-3.ml-lg-auto.px-0.order-3.order-lg-1.order-xl-1 div.mt-3.col-12.px-0 div.card.panel-common.mb-3.theme-advert-card { display: none !important; }
+            .advert:has(a[data-banner-name*="flipnote_organizer_promo"]),
+            .advert:has(a[data-banner-name*="sudomemo_wii_room"]),
+            .advert:has(a[data-banner-name*="3ds_install_guide"]),
+            .advert:has(a[data-banner-name*="staying_safe_online"]),
+            .advert:has(a[data-banner-name*="organizer_slim"]),
+            .advert:has(a[data-banner-name*="archive_slim"]),
+            #left-sidebar .card.theme-advert-card {
+                display: none !important;
+            }
         `);
     }
 
     if (hideFlipstreams) {
         GM_addStyle(`
-            html body.theme-body.body-fullwidth-mobile div.row.page-inner div.col-12.col-lg-12.col-xl-8.px-0 div.col-md-12.col-lg-12.col-xl-12.px-0 div.frontpage-flipstream-row.mx-3.mx-sm-0.mb-3,
-            html body.theme-body.body-fullwidth-mobile div.row.pt-sm-1 div#center-column.col-12.col-lg-7.col-xl-6.px-0.mr-lg-auto.px-lg-3.order-1.order-xl-2 div#recommended-flipstreams-mobile.card.panel-common.mb-sm-3.d-xl-none,
-            html body.theme-body.body-fullwidth-mobile div.row.pt-sm-1 div#playlist-and-feed-sidebar.col-12.col-xl-3.px-0.order-2.order-xl-3 div#recommended-flipstreams.card.panel-common.mb-sm-3.d-none.d-xl-block,
-            html body.theme-body.body-fullwidth-mobile div.row.page-inner div.col-12.col-lg-12.col-xl-8.px-0 div.col-md-12.col-lg-12.col-xl-12.px-0 div#front-explore.card.panel-header-only.mb-3 {
-                display: none !important;
-            }
+            .frontpage-flipstream-row,
+            #recommended-flipstreams-mobile,
+            #recommended-flipstreams,
+            #front-explore { display: none !important; }
         `);
     }
 
